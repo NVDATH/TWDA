@@ -474,12 +474,12 @@ class _DB:
 			).fetchone()
 		return row[0] if row else 0
 
-	def oldest_unread(self, account_id):
-		"""The oldest tweet not read yet, or None (auto read)."""
+	def oldest_unread(self, account_id, after=0):
+		"""The oldest tweet not read yet (with an id above after), or None (auto read)."""
 		with self._lock:
 			row = self._conn.execute(
-				"SELECT %s FROM tweets WHERE account_id = ? AND is_read = 0 ORDER BY id ASC LIMIT 1" % _COLS,
-				(account_id,),
+				"SELECT %s FROM tweets WHERE account_id = ? AND is_read = 0 AND id > ? ORDER BY id ASC LIMIT 1" % _COLS,
+				(account_id, int(after)),
 			).fetchone()
 		return Post(*row) if row else None
 
@@ -790,8 +790,8 @@ class Store:
 	def unread_count(self, account_id):
 		return self._db(account_id).unread_count(account_id)
 
-	def oldest_unread(self, account_id):
-		return self._db(account_id).oldest_unread(account_id)
+	def oldest_unread(self, account_id, after=0):
+		return self._db(account_id).oldest_unread(account_id, after)
 
 	def add_posts(self, account_id, posts):
 		self._db(account_id).add_posts(account_id, posts)
@@ -968,9 +968,9 @@ class MemoryStore:
 		with self._lock:
 			return sum(1 for p in self._posts(account_id).values() if not p.is_read)
 
-	def oldest_unread(self, account_id):
+	def oldest_unread(self, account_id, after=0):
 		with self._lock:
-			unread = [p for p in self._posts(account_id).values() if not p.is_read]
+			unread = [p for p in self._posts(account_id).values() if not p.is_read and p.id > after]
 			return copy.copy(min(unread, key=lambda p: p.id)) if unread else None
 
 	def add_posts(self, account_id, posts):

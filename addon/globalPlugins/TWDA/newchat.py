@@ -102,6 +102,7 @@ class NewChatDialog(wx.Dialog):
 	def _show_found(self, shown):
 		for control in (self.foundLabel, self.found, self.addButton):
 			control.Show(shown)
+			control.Enable(shown)
 		self.Layout()
 
 	def _refresh_people(self):
@@ -110,6 +111,7 @@ class NewChatDialog(wx.Dialog):
 		shown = bool(self.recipients)
 		for control in (self.peopleLabel, self.people, self.removeButton):
 			control.Show(shown)
+			control.Enable(shown)
 		if shown:
 			self.people.SetSelection(0)
 		self.Layout()

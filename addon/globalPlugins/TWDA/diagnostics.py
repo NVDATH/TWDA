@@ -1698,6 +1698,16 @@ def run_selfcheck(plugin):
 			text, _events, _moved = reader._next_from_cache(aid, {"kind": "user", "key": "u"})
 			order.append(text.split(", ")[-1])
 		assert order == ["t7", "t8", "t9", "pinned: t3"], "auto read order: %s" % order
+		# a tab with a filter: the hidden tweets are skipped and stay unread
+		mixed = [
+			Post(i, "N (@u)", "t%d" % i, 0, "https://x.com/u/status/%d" % i, reply_to="a" if i % 2 else "")
+			for i in (4, 3, 2, 1)
+		]
+		tabstate.set_cache(store, aid, "user", "v", mixed)
+		store.set_account_meta(aid, "tabfilter:user:v", "replies")
+		picked = [reader._next_from_cache(aid, {"kind": "user", "key": "v"}) for _n in range(3)]
+		assert [p[0].split(", ")[-1] if p else None for p in picked] == ["t2", "t4", None], picked
+		assert [p.is_read for p in tabstate.get_cache(store, aid, "user", "v")] == [True, False, True, False]
 
 	check("Auto read: the pinned tweet of a user timeline is read last, as the list shows it", auto_read_pinned_last)
 
@@ -2123,6 +2133,62 @@ def run_selfcheck(plugin):
 	check("Direct messages: the store keeps read marks, counts unread, deletes", dm_store)
 	check("Direct messages: inbox, pages, older batch, send and delete jobs", dm_jobs)
 
+	def dm_media_job():
+		import asyncio
+		from . import attachments
+
+		class FakeClient:
+			def __init__(self, status=200, content_type="image/png"):
+				self.calls, self.status, self.content_type = [], status, content_type
+
+			@property
+			def _base_headers(self):
+				return {"authorization": "Bearer x", "content-type": "application/json", "Referer": "https://x.com/"}
+
+			async def _send(self, method, url, **kwargs):
+				self.calls.append((method, url, kwargs))
+				return SimpleNamespace(
+					status_code=self.status, content=b"\x89PNG data", headers={"content-type": self.content_type},
+				)
+
+		service = FetchService(MemoryStore(), notify=lambda callback, result: None)
+		url = "https://ton.twitter.com/i/ton/data/dm/1/2/x.png"
+		options = {"url": url, "kind": "image", "stem": 'Pal (@pal) a/b:c?"d'}
+		loop = asyncio.new_event_loop()
+		paths = []
+		try:
+			client = FakeClient()
+			done = loop.run_until_complete(service._dm_media(client, 1, options))
+			assert done["ok"], done
+			paths.append(done["path"])
+			assert done["path"].endswith(".png") and os.path.isfile(done["path"]), done["path"]
+			name = os.path.basename(done["path"])
+			assert not any(c in name for c in '/\\:?"'), "unsafe file name: " + name
+			method, got_url, kwargs = client.calls[0]
+			assert method == "GET" and got_url == url and kwargs.get("follow_redirects") is True, client.calls
+			assert "content-type" not in kwargs["headers"] and kwargs["headers"]["authorization"] == "Bearer x", kwargs
+			assert attachments.cached_media(url) == done["path"], "the file was not remembered"
+			gone = loop.run_until_complete(service._dm_media(FakeClient(status=404), 1, options))
+			assert not gone["ok"] and "404" in gone["message"], gone
+			odd = loop.run_until_complete(service._dm_media(FakeClient(content_type="text/html"), 1, options))
+			assert not odd["ok"], "a page was taken for an image"
+			clip = loop.run_until_complete(service._dm_media(
+				FakeClient(content_type="video/mp4"), 1, dict(options, url=url + "v", kind="video"),
+			))
+			assert clip["ok"] and clip["path"].endswith(".mp4"), clip
+			paths.append(clip["path"])
+		finally:
+			loop.close()
+			attachments._cache.pop(url, None)
+			attachments._cache.pop(url + "v", None)
+			for path in paths:
+				try:
+					os.remove(path)
+				except OSError:
+					pass
+
+	check("Direct messages: the media of a message is fetched with the client's headers and kept under a readable name", dm_media_job)
+
 	def dm_inbox_paging():
 		import asyncio
 
@@ -2319,6 +2385,173 @@ def run_selfcheck(plugin):
 			frame.Destroy()
 
 	check("Virtual list: the real control keeps count, focus and selection by index and empties", virtual_list_control)
+
+	def reply_all_names():
+		from .utils import reply_all_handles
+		mine = Post(
+			1, "N (@x)", "hi @c and @B and @x", 0, "https://x.com/x/status/1", reply_to="a",
+			stats=json.dumps({"mentions": ["A", "b", "me", "x", "d"]}),
+		)
+		names = reply_all_handles(mine, "Me")
+		assert names == ["a", "b", "d", "c"], names  # the author and the account itself are left out, no repeats
+		retweet = Post(2, "R (@r)", "t @q", 0, "https://x.com/o/status/2", kind="retweet", orig_author="O (@o)")
+		assert reply_all_handles(retweet, "") == ["r", "q"], "the retweeter comes after the original author"
+		assert reply_all_handles(retweet, "R") == ["q"], "the account itself is left out"
+		quote = Post(
+			4, "N (@x)", "hi", 0, "https://x.com/x/status/4", quote_author="Q (@q)", quote_text="t", reply_to="a",
+		)
+		assert reply_all_handles(quote, "") == ["a", "q"], "the author of the quoted tweet is in"
+		assert reply_all_handles(Post(3, "N (@x)", "plain", 0, "https://x.com/x/status/3"), "") == [], "nobody to add"
+
+	check("Reply to all: the other users of a tweet, without its author and the account", reply_all_names)
+
+	def bg_news_text():
+		from . import core as core_module
+		said = []
+		fake = SimpleNamespace(_bg_announces=lambda cat, aid, tab: True, _tag=lambda aid, text: text)
+		old_message, old_play = core_module.ui.message, core_module.soundpack.play
+		core_module.ui.message = lambda text, *args, **kwargs: said.append(text)
+		core_module.soundpack.play = lambda key: None
+		try:
+			GlobalPlugin._bg_news(fake, "tabs", "Search: cats", None, "search:cats", 3)
+			GlobalPlugin._bg_news(fake, "tabs", "Search: cats", None, "search:cats", True)
+			GlobalPlugin._bg_news(fake, "tabs", "Search: cats", None, "search:cats")
+			GlobalPlugin._bg_news(fake, "notifications", 4)
+			GlobalPlugin._bg_news(fake, "chat", 2)
+		finally:
+			core_module.ui.message, core_module.soundpack.play = old_message, old_play
+		assert said == [
+			"3 new in Search: cats", "New in Search: cats", "New in Search: cats", "4 new notifications",
+			"2 chats with new messages",
+		], said
+
+	check("Background: the news of an open tab says how many are new when it is known", bg_news_text)
+
+	def chat_background():
+		from .chat import count_news
+		old = {"a": {"last_id": 5}, "b": {"last_id": 7}, "s": {"last_id": 1}}
+		rows = [
+			{"convo_id": "a", "last_id": 9, "trusted": True},  # an event newer than the cache had
+			{"convo_id": "b", "last_id": 7, "trusted": True},  # the same
+			{"convo_id": "c", "last_id": 3, "trusted": True},  # a conversation the cache did not have
+			{"convo_id": "r", "last_id": 4, "trusted": False},  # a request: not counted
+			{"convo_id": "s", "last_id": 2, "trusted": True, "low_quality": True},  # spam: not counted
+		]
+		assert count_news(old, rows) == 2, count_news(old, rows)
+		assert count_news({}, rows) == 0, "the first reading is not news"
+		cfg = Config(MemoryStore(), 1)
+		fake = SimpleNamespace(_store=MemoryStore())
+		assert "chat" not in [n for n, _m in GlobalPlugin._bg_items(fake, 1, cfg)], "Chat is switched off by default"
+		cfg.set("tabs_off", "")
+		cfg.set("bg_interval_chat", 15)
+		assert ("chat", 15) in GlobalPlugin._bg_items(fake, 1, cfg), "Chat is checked when its tab is on"
+
+	check("Chat: the background check counts conversations with news, and runs only when the tab is on", chat_background)
+
+	def search_tab_settings():
+		cfg = Config(MemoryStore(), 1)
+		cfg.set("bg_tab_settings", json.dumps({"search:Latest|a": [5, False], "user:x": [10, True]}))
+		cfg.set("tray_tabs", json.dumps(["search:Latest|a", "thread:1"]))
+		fake = SimpleNamespace(_config=cfg, _unread_known={"search:Latest|a": 3})
+		fake._tray_picked = lambda: GlobalPlugin._tray_picked(fake)
+		GlobalPlugin.move_tab_settings(fake, "search:Latest|a", "search:Latest|b")
+		own = json.loads(cfg.get("bg_tab_settings"))
+		assert own == {"search:Latest|b": [5, False], "user:x": [10, True]}, own
+		assert json.loads(cfg.get("tray_tabs")) == ["search:Latest|b", "thread:1"], cfg.get("tray_tabs")
+		assert not fake._unread_known, "the count of the old key stayed"
+		GlobalPlugin.move_tab_settings(fake, "search:none", "search:Latest|c")  # nothing was kept for this key
+		assert json.loads(cfg.get("bg_tab_settings")) == own, "a key with no settings changed them"
+
+	check("Search tabs: when a search is edited in place, the tab's own settings and tray place move with it", search_tab_settings)
+
+	def load_search_key():
+		"""The form of Search and explore, with the real code of load_search, remembers the tab it edits."""
+		form = SimpleNamespace(
+			typeRadio=SimpleNamespace(SetSelection=lambda i: None), _types=("tweets", "people", "trends"),
+			_show_type=lambda: None, query=SimpleNamespace(SetValue=lambda v: None),
+			exclude=SimpleNamespace(SetValue=lambda v: None),
+			incl=SimpleNamespace(CheckedItems=[]), omit=SimpleNamespace(CheckedItems=[]),
+			_incl=[], _omit=[], adv={name: SimpleNamespace(SetValue=lambda v: None) for name in ("from", "to", "replies")},
+			order=SimpleNamespace(SetSelection=lambda i: None), _set_adv=lambda open_: None,
+			_update_go=lambda: None, Layout=lambda: None, _save_state=lambda: None, _editing=None,
+		)
+		explore.ExploreTab.load_search(form, {"query": "cats", "product": "Latest"}, "Latest|cats")
+		assert form._editing == "Latest|cats", "the tab to replace became %r" % (form._editing,)
+		explore.ExploreTab.load_search(form, {"query": "cats"})
+		assert form._editing is None, "a search that is not an edit has no tab to replace"
+
+	check("Search tabs: the form of Search and explore remembers which tab it edits", load_search_key)
+
+	def tab_filters():
+		from . import tabs
+		from .utils import parse_timeline_filter, post_passes
+		mk = lambda i, **kw: Post(i, "N (@u)", "t%d" % i, 0, "https://x.com/u/status/%d" % i, **kw)
+		plain = mk(1)
+		retweet = mk(2, kind="retweet", orig_author="O (@o)")
+		reply = mk(3, reply_to="a")
+		quote = mk(4, quote_author="Q (@q)", quote_text="q")
+		image = mk(5, embeds=json.dumps([{"t": "image", "url": "https://x/i.jpg"}]))
+		link = mk(6, embeds=json.dumps([{"t": "link", "url": "https://x/l", "label": "l"}]))
+		video = mk(7, embeds=json.dumps([{"t": "video", "url": "https://x/v.mp4"}]))
+		gif = mk(8, embeds=json.dumps([{"t": "gif", "url": "https://x/g.mp4"}]))
+		sensitive = mk(9, stats=json.dumps({"sensitive": True}))
+		both = mk(10, embeds=json.dumps([{"t": "image", "url": "https://x/i.jpg"}, {"t": "link", "url": "https://x/l"}]))
+		everyone = [plain, retweet, reply, quote, image, link, video, gif, sensitive, both]
+
+		def shown(keys):
+			states = parse_timeline_filter(keys)
+			return [p.id for p in everyone if post_passes(p, states)]
+
+		assert shown("") == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "nothing set: everything shows"
+		assert shown("retweets") == [1, 3, 4, 5, 6, 7, 8, 9, 10] and shown("replies:hide") == [1, 2, 4, 5, 6, 7, 8, 9, 10]
+		assert shown("quotes") == [1, 2, 3, 5, 6, 7, 8, 9, 10] and shown("sensitive") == [1, 2, 3, 4, 5, 6, 7, 8, 10]
+		assert shown("images") == [1, 2, 3, 4, 6, 7, 8, 9], shown("images")
+		assert shown("videos") == [1, 2, 3, 4, 5, 6, 8, 9, 10] and shown("gifs") == [1, 2, 3, 4, 5, 6, 7, 9, 10]
+		assert shown("links") == [1, 2, 3, 4, 5, 7, 8, 9], shown("links")
+		assert shown("images:hide,links:hide") == [1, 2, 3, 4, 7, 8, 9], "a tweet of either hidden kind goes"
+		assert shown("retweets,replies,quotes") == [1, 5, 6, 7, 8, 9, 10], shown("retweets,replies,quotes")
+		assert shown("images:only") == [5, 10], shown("images:only")
+		assert shown("images:only,links:only") == [5, 6, 10], "show only: a tweet must be one of the kinds"
+		assert shown("images:only,links:hide") == [5], "hiding wins over showing only"
+		assert shown("retweets:only,replies:only") == [2, 3], shown("retweets:only,replies:only")
+		assert shown("nonsense,replies:x,replies:hide") == [1, 2, 4, 5, 6, 7, 8, 9, 10], "unknown names and states dropped"
+		from .utils import format_timeline_filter
+		assert format_timeline_filter({"links": "only", "retweets": "hide", "images": "show"}) == "retweets:hide,links:only"
+		assert parse_timeline_filter(format_timeline_filter({"gifs": "only", "quotes": "hide"})) == {"gifs": "only", "quotes": "hide"}
+		# the view over a tab's tweets
+		data = feedlist.OrderedPosts(True)
+		for p in everyone:
+			data.add(p)
+		view = feedlist.FilteredPosts(data)
+		assert view.rows is data.rows and len(view) == 10 and view.index_of(5) == data.index_of(5), "no filter: the same rows"
+		states = parse_timeline_filter("replies,retweets")
+		view = feedlist.FilteredPosts(data, lambda p: post_passes(p, states))
+		assert [p.id for p in view.rows] == [10, 9, 8, 7, 6, 5, 4, 1] and len(data.rows) == 10, [p.id for p in view.rows]
+		assert view.index_of(5) == 5 and view.index_of(3) == -1 and view.newest_first is True
+		data.add(mk(11))
+		assert len(view) == 8, "a tweet added to the data shows only after refresh()"
+		view.refresh()
+		assert [p.id for p in view.rows][:2] == [11, 10] and view.index_of(11) == 0
+		# a thread cannot hide retweets or replies
+		assert "replies" not in tabs.ThreadPanel.FILTER_KEYS and "retweets" not in tabs.ThreadPanel.FILTER_KEYS
+		assert "images" in tabs.ThreadPanel.FILTER_KEYS and not tabs.SearchTab.FILTERABLE
+
+	check("Tab filters: each kind of tweet hidden alone and together, the unknown dropped, the view over a tab's tweets", tab_filters)
+
+	def user_choices():
+		from .utils import relevant_users
+		post = Post(
+			1, "N (@x)", "hi @c and @B", 0, "https://x.com/x/status/1", reply_to="a",
+			stats=json.dumps({"mentions": ["A", "b", "d"]}),
+		)
+		names = [user for _label, user in relevant_users(post)]
+		assert names == ["x", "a", "b", "d", "c"], names  # the cut leading mentions (d) are in, no repeats
+		old = Post(2, "N (@x)", "hi @c", 0, "https://x.com/x/status/2", reply_to="a")  # cached before the list was kept
+		assert [user for _label, user in relevant_users(old)] == ["x", "a", "c"], "an old row lost its users"
+		quote = Post(3, "N (@x)", "hi", 0, "https://x.com/x/status/3", quote_author="Q (@q)", quote_text="re @z and @X")
+		assert [user for _label, user in relevant_users(quote)] == ["x", "q", "z"], "the quoted text's users are in"
+
+	check("User menu: the users of a tweet include the leading mentions X cut from the text", user_choices)
 
 	# ---------------------------------------------------------------- background queue and messages
 

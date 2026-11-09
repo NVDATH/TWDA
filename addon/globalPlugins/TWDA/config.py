@@ -17,6 +17,7 @@ DEFAULTS = {
 	"bg_interval_notifications": 15,
 	"bg_interval_bookmarks": 0,
 	"bg_interval_trends": 0,        # Search and explore: minutes between background loads of the trends shown last
+	"bg_interval_chat": 0,          # Chat: minutes between background reads of the first page of the inbox, 0 = off
 	"bg_interval_tabs": 0,          # open tabs: minutes for a tab with no setting of its own
 	"bg_tab_settings": "",          # JSON {"<type>:<key>": [minutes, speak]} for open tabs that differ from that default
 	"bg_announce_off": "",          # comma separated categories (home, notifications, tabs) that are checked silently
@@ -44,6 +45,7 @@ RANGES = {
 	"bg_interval_notifications": (0, 60),
 	"bg_interval_bookmarks": (0, 60),
 	"bg_interval_trends": (0, 60),
+	"bg_interval_chat": (0, 60),
 	"bg_interval_tabs": (0, 60),
 	"auto_pause": (1, 10),
 	"feed_pages": (1, 5),

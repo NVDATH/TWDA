@@ -94,6 +94,8 @@ ENTER_ACTION_CHOICES = [
 	# Translators: Enter key action choice.
 	("reply", _("Reply")),
 	# Translators: Enter key action choice.
+	("reply_all", _("Reply to all")),
+	# Translators: Enter key action choice.
 	("quote", _("Quote tweet")),
 	# Translators: Enter key action choice.
 	("retweet", _("Retweet / Undo retweet")),
@@ -139,6 +141,7 @@ TARGET_CHOICES = [
 BG_KEYS = {
 	"home": "bg_interval", "notifications": "bg_interval_notifications",
 	"bookmarks": "bg_interval_bookmarks", "tabs": "bg_interval_tabs", "trends": "bg_interval_trends",
+	"chat": "bg_interval_chat",
 }
 
 UPDATE_ROWS = [  # the tabs every account has, first rows of the Updates table
@@ -148,6 +151,8 @@ UPDATE_ROWS = [  # the tabs every account has, first rows of the Updates table
 	("notifications", _("Notifications")),
 	# Translators: Row of the Updates table (the Bookmarks tab).
 	("bookmarks", _("Bookmarks")),
+	# Translators: Row of the Updates table (the Chat tab).
+	("chat", _("Chat")),
 ]
 
 
@@ -333,9 +338,9 @@ class AccountsPage(wx.Panel):
 			if acc["id"] == focus_id or (focus_id is None and acc["active"]):
 				select = i
 		has_accounts = bool(self._accounts)
-		for button in (self.active_btn, self.rename_btn, self.remove_btn):
+		for button in (self.active_btn, self.rename_btn, self.remove_btn, self.bg_check):
 			button.Show(has_accounts)
-		self.bg_check.Show(has_accounts)
+			button.Enable(has_accounts)
 		if has_accounts:
 			self.list.Focus(select)
 			self.list.Select(select)
@@ -563,7 +568,7 @@ class DisplayPage(wx.Panel):
 		aid = plugin.account_id()
 		if aid is not None:
 			for entry in tabstate.get_open_tabs(plugin.store, aid):
-				if entry["type"] != "users":  # a list of users has nothing unread
+				if entry["type"] not in ("users", "convo"):  # a list of users or a conversation has no unread tweets
 					items.append(("%s:%s" % (entry["type"], entry["key"]), entry.get("name") or entry["key"]))
 		return items
 
@@ -995,7 +1000,7 @@ class UpdatesPage(wx.Panel):
 				self._tab_ids.append(ident)
 				names[ident] = entry.get("name") or entry["key"]
 		self._minutes = {ident: cfg.get(key) for ident, key in BG_KEYS.items()}  # home, notifications, bookmarks, tabs
-		self._speak = {ident: ident not in quiet for ident in ("home", "notifications", "tabs")}
+		self._speak = {ident: ident not in quiet for ident in ("home", "notifications", "chat", "tabs")}
 		for ident in self._tab_ids:
 			self._minutes[ident], self._speak[ident] = cfg.tab_setting(ident)
 		self._own = {ident for ident in self._tab_ids if ident in saved}  # tabs the reader gave a setting of their own
@@ -1004,7 +1009,7 @@ class UpdatesPage(wx.Panel):
 		labels.update(names)
 		# Translators: Last item of the speak checklist on the Updates page: the setting of tabs opened later.
 		labels["tabs"] = _("New tabs")
-		self._speak_ids = ["home", "notifications"] + self._tab_ids + ["tabs"]
+		self._speak_ids = ["home", "notifications", "chat"] + self._tab_ids + ["tabs"]
 
 		sizer = wx.BoxSizer(wx.VERTICAL)
 		# Translators: Label above the checklist of tabs whose background checks speak when they find news (bookmarks never speak).
@@ -1028,6 +1033,8 @@ class UpdatesPage(wx.Panel):
 			("bookmarks", _("Check boo&kmarks:")),
 			# Translators: Label of a background check interval choice (the trends of the Search and explore tab).
 			("trends", _("Check t&rends:")),
+			# Translators: Label of a background check interval choice (the Chat tab: it reads the first page of the list of conversations).
+			("chat", _("Check &chat:")),
 		]
 		# Translators: Label of the background check interval choice of one open tab. {name} is the tab name.
 		rows += [(ident, _("Check {name}:").format(name=names[ident].replace("&", "&&"))) for ident in self._tab_ids]
@@ -1099,7 +1106,7 @@ class UpdatesPage(wx.Panel):
 				minutes[ident], speak[ident] = default
 		for ident, key in BG_KEYS.items():
 			cfg.set(key, minutes[ident])
-		cfg.set("bg_announce_off", ",".join(k for k in ("home", "notifications", "tabs") if not speak[k]))
+		cfg.set("bg_announce_off", ",".join(k for k in ("home", "notifications", "chat", "tabs") if not speak[k]))
 		cfg.set("bg_tab_settings", json.dumps(own) if own else "")
 		self._own = set(own)
 		self._show(minutes, speak)

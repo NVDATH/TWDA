@@ -15,6 +15,7 @@ from scriptHandler import script
 
 from . import attachments, keymap, soundpack, tabstate
 from .autoread import AutoReader
+from .chat import OWN_KEY, count_news
 from .compose import ComposeDialog
 from .config import BG_TAB_TYPES, Config
 from .mainwindow import MainWindow
@@ -23,7 +24,9 @@ from .settings import AddAccountDialog, SettingsDialog
 from .storage import open_store
 from .tabs import build_tabs
 from .tray import TrayIcon, category_labels, choose_overlay, fill_app_menu
-from .utils import APP_NAME, TAG, account_label, announce_after_menu, announce_now, is_pinned
+from .utils import (
+	APP_NAME, TAG, account_label, announce_after_menu, announce_now, is_pinned, parse_timeline_filter, post_passes,
+)
 
 addonHandler.initTranslation()
 
@@ -31,7 +34,7 @@ BG_TICK_MS = 60000             # how often we check whether a background update 
 BG_JITTER = 0.25               # up to +25% of the interval is added at random
 BG_KEYS = {  # the tabs every account has: the setting that holds the minutes between checks
 	"home": "bg_interval", "notifications": "bg_interval_notifications", "bookmarks": "bg_interval_bookmarks",
-	"trends": "bg_interval_trends",
+	"trends": "bg_interval_trends", "chat": "bg_interval_chat",
 }
 STARTUP_DELAY_MS = 3000        # after NVDA starts: open the cache, show the tray icon
 STARTUP_SYNC_DELAY_MS = 15000  # after NVDA starts: load new tweets once
@@ -263,11 +266,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	# ------------------------------------------------------------ tray icon
 
-	def _unread_now(self):
-		if self._store is None or self._active is None:
-			return 0
-		return self._store.unread_count(self._active["id"])
-
 	def _tray_picked(self, cfg=None):
 		"""Ids of the tabs, besides Home and Notifications, that the tray icon counts (cfg: settings of an account)."""
 		try:
@@ -462,6 +460,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if entry is None:
 			return
 		entry = dict(entry, name=panel.TAB_NAME)  # a renamed tab keeps its new name
+		raw_filter = self._store.get_account_meta(aid, "tabfilter:%s:%s" % (kind, key))
+		if raw_filter:
+			entry["filter"] = raw_filter  # read before the tab goes: removing it forgets the filter
 		stack = self._closed_tabs.setdefault(aid, [])
 		stack.append((entry, snapshot(), position, panel._current_post_id()))
 		del stack[:-CLOSED_TABS_KEPT]
@@ -478,6 +479,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	def account_label(self):
 		return account_label(self._active)
+
+	def account_handle(self):
+		"""User name (no @) of the active account, or ''."""
+		return (self._active or {}).get("handle") or ""
 
 	def add_account(self, identity, cookies):
 		"""Store a checked account and make it the active one. Returns its id."""
@@ -739,7 +744,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def _bg_items(self, aid, cfg):
 		"""[(item, minutes between checks)] of everything the background check of an account covers: Home,
 		Notifications, Bookmarks and every open user / search / list / thread / quotes tab (item "<type>:<key>")."""
-		items = [(item, cfg.get(key)) for item, key in BG_KEYS.items()]
+		off = {k for k in cfg.get("tabs_off").split(",") if k}
+		items = [(item, cfg.get(key)) for item, key in BG_KEYS.items() if item != "chat" or "chat" not in off]
 		for entry in tabstate.get_open_tabs(self._store, aid):
 			if entry["type"] in BG_TAB_TYPES:
 				ident = "%s:%s" % (entry["type"], entry["key"])
@@ -818,6 +824,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			)
 		if cat == "trends":
 			return self._run_bg_trends(aid)
+		if cat == "chat":
+			return self._run_bg_chat(aid)
 		main = self._live_main() if aid == self.account_id() else None  # an open tab: refresh the tab itself, else its saved copy
 		if main is not None:
 			for panel in main.getOpenTabs():
@@ -827,13 +835,46 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 					and "%s:%s" % (panel.TAB_TEMP_TYPE, panel.TAB_TEMP_KEY) == cat
 				):
 					return panel.refresh(
-						lambda changed, p=panel: self._bg_news("tabs", p.TAB_NAME, aid, cat) if changed else None,
+						lambda changed, p=panel: self._bg_news("tabs", p.TAB_NAME, aid, cat, changed) if changed else None,
 						quiet=True,
 					)
 		entry = next(
 			(e for e in tabstate.get_open_tabs(self._store, aid) if "%s:%s" % (e["type"], e["key"]) == cat), None
 		)
 		return self._bg_saved_tab(aid, entry) if entry is not None else False
+
+	def _run_bg_chat(self, aid):
+		"""One request: the first page of the inbox, where each conversation says what its newest event is, so
+		the conversations with news are found without reading any of them. The Chat tab refreshes itself when it
+		is open; otherwise the answer goes into the account's cache."""
+		main = self._live_main() if aid == self.account_id() else None
+		if main is not None:
+			for panel in main.getOpenTabs():
+				if getattr(panel, "TAB_KEY", None) == "chat":
+					return panel.refresh(
+						lambda changed: self._bg_news("chat", changed, aid) if changed else None, quiet=True,
+					)
+		return self._service.submit("dm_inbox", self._on_bg_chat, {"account_id": aid, "pages": 1}, background=True)
+
+	def _on_bg_chat(self, result):
+		aid = result.get("account_id")
+		if not self._account_exists(aid):
+			return  # the account was removed meanwhile
+		if not result["ok"]:
+			self._bg_failed(aid, result["message"])
+			return
+		self._bg_last_error.pop(aid, None)
+		store = self._store
+		old = {c["convo_id"]: c for c in store.dm_load_convos(aid)}
+		rows = result["convos"]
+		for row in rows:
+			row["seen_id"] = (old.get(row["convo_id"]) or {}).get("seen_id", 0)  # what was marked read here stays so
+		store.dm_save_convos(aid, rows)
+		if result.get("own"):
+			store.set_account_meta(aid, OWN_KEY, result["own"])
+		news = count_news(old, rows)
+		if news:
+			self._bg_news("chat", news, aid)
 
 	def _run_bg_trends(self, aid):
 		"""Load again the trends that the Search and explore tab showed last, into their cache. Nothing is said:
@@ -911,8 +952,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			if own:
 				self._unread_known.pop(ident, None)
 				self.tray_refresh()
-			if any(p.id not in known for p in posts):
-				self._bg_news("tabs", entry.get("name") or entry["key"], aid, ident)
+			new = self._shown_count(
+				aid, "tabfilter:%s:%s" % (entry["type"], entry["key"]), [p for p in posts if p.id not in known],
+			)
+			if new:
+				self._bg_news("tabs", entry.get("name") or entry["key"], aid, ident, new)
 			return
 		fresh = [p for p in result["posts"] if p.id not in known]
 		if not fresh:
@@ -922,7 +966,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if own:
 			self._unread_known.pop(ident, None)
 			self.tray_refresh()
-		self._bg_news("tabs", entry.get("name") or entry["key"], aid, ident)
+		shown = self._shown_count(aid, "tabfilter:%s:%s" % (entry["type"], entry["key"]), fresh)
+		if shown:
+			self._bg_news("tabs", entry.get("name") or entry["key"], aid, ident, shown)
+
+	def _shown_count(self, aid, filter_name, posts):
+		"""How many of these tweets show under the filter kept for a tab that is not open (account meta, see
+		TweetPanel._filter_key)."""
+		states = parse_timeline_filter(self._store.get_account_meta(aid, filter_name))
+		return sum(1 for p in posts if post_passes(p, states))
 
 	def _known_ids(self, aid, cat):
 		"""Ids of the tweets a tab of this account already has: from the open tab, else from its cache."""
@@ -930,7 +982,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if main is not None:
 			for panel in main.getOpenTabs():
 				if getattr(panel, "TAB_KEY", None) == cat:
-					return [p.id for p in panel._posts.rows]
+					return [p.id for p in panel._all_rows()]
 		cached = tabstate.get_cache(self._store, aid, cat, cat) or []
 		return [p.id for p in cached]
 
@@ -949,6 +1001,24 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def live_main(self):
 		return self._live_main()
 
+	def move_tab_settings(self, old, new):
+		"""A tab got another key (the search of a search tab was edited): its own background setting and its place
+		among the tabs the tray icon counts follow it. old, new: "<type>:<key>"."""
+		cfg = self._config
+		try:
+			own = json.loads(cfg.get("bg_tab_settings") or "{}")
+		except ValueError:
+			own = {}
+		if isinstance(own, dict) and old in own:
+			own[new] = own.pop(old)
+			cfg.set("bg_tab_settings", json.dumps(own))
+		picked = self._tray_picked()
+		if old in picked:
+			picked.discard(old)
+			picked.add(new)
+			cfg.set("tray_tabs", json.dumps(sorted(picked)))
+		self._unread_known.pop(old, None)
+
 	def unread_invalidate(self, ident):
 		"""A tab's unread count changed in its cache (auto read): forget the remembered value, redraw the icon."""
 		self._unread_known.pop(ident, None)
@@ -962,15 +1032,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			return cfg.tab_setting(tab)[1]
 		return cat not in {k for k in cfg.get("bg_announce_off").split(",") if k}
 
-	def _bg_news(self, cat, info, aid=None, tab=None):
+	def _bg_news(self, cat, info, aid=None, tab=None, count=None):
 		"""A background check found news: always the sound, speech only for what speaks.
 		aid: the account it is about (default: the active one); another account's news starts with its @user.
-		tab: the open tab it is about ("<type>:<key>"), whose own setting says whether to speak."""
+		tab: the open tab it is about ("<type>:<key>"), whose own setting says whether to speak.
+		count: how many items of the tab are new, when that is known."""
 		soundpack.play("notification")
 		if not self._bg_announces(cat, aid, tab):
 			return
 		if cat == "notifications":
 			text = _("{count} new notifications").format(count=info)
+		elif cat == "chat":
+			# Translators: Announced when a background check of the Chat tab found conversations with new messages. {count} is how many conversations.
+			text = _("{count} chats with new messages").format(count=info)
+		elif isinstance(count, int) and not isinstance(count, bool) and count > 0:
+			# Translators: Announced when a background check refreshed an open tab and found new items. {count} is how many, {name} the tab name.
+			text = _("{count} new in {name}").format(count=count, name=info)
 		else:
 			# Translators: Announced when a background check refreshed an open tab and found changes. {name} is the tab name.
 			text = _("New in {name}").format(name=info)
@@ -1009,7 +1086,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			tabstate.set_cache(self._store, aid, cat, cat, merged[:500])
 			if own:
 				self._unread_known.pop(cat, None)
-		return len(fresh)
+		return self._shown_count(aid, "tabfilter:" + cat, fresh)
 
 	def _on_bg_result(self, result):
 		self._report_new(result, always=False)
@@ -1068,8 +1145,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def script_openTimeline(self, gesture):
 		self.open_main_window()
 
-	def open_compose(self, reply_to=None, quote_of=None):
-		"""The compose window (new tweet, reply or quote). Non-modal, owned by NVDA's main frame."""
+	def open_compose(self, reply_to=None, quote_of=None, prefill=""):
+		"""The compose window (new tweet, reply or quote). Non-modal, owned by NVDA's main frame.
+		prefill: text the box starts with (reply to all puts the other users there)."""
 		try:
 			self._ensure_backend()
 		except Exception:
@@ -1083,6 +1161,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		try:
 			dlg = ComposeDialog(
 				gui.mainFrame, self, onClosed=self._compose_closed, reply_to=reply_to, quote_of=quote_of,
+				prefill=prefill,
 			)
 			dlg.Show()
 			dlg.Raise()
@@ -1111,35 +1190,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			main.merge_result({"posts": [post], "account_id": aid})
 		self.tray_refresh()
 
-	def _unread_summary(self):
-		counts = []
-		unread = self._unread_now()
-		if unread:
-			counts.append((_("Home"), unread))
-		unread = self._cached_unread("notifications")
-		if unread:
-			counts.append((_("Notifications"), unread))
-		if not counts:
-			# Translators: Spoken by the read-unread command when nothing is unread. {name} is the add-on name.
-			return _("{name}: no unread").format(name=APP_NAME)
-		# Translators: Spoken by the read-unread command. {name} is the add-on name, {counts} a list such as "Home 12, Notifications 3".
-		return _("{name} unread: {counts}").format(
-			name=APP_NAME, counts=", ".join("%s %d" % (label, n) for label, n in counts)
-		)
-
-	@script(
-		# Translators: Input help description for the command that reads the unread counts. {name} is the add-on name.
-		description=_("{name}: read the unread count").format(name=APP_NAME),
-		category=APP_NAME,
-	)
-	def script_readUnread(self, gesture):
-		try:
-			self._ensure_backend()
-		except Exception:
-			log.error(TAG + "could not start", exc_info=True)
-			return
-		ui.message(self._unread_summary())
-
 	@script(
 		# Translators: Input help description for the command that opens the compose window. {name} is the add-on name.
 		description=_("{name}: write a new tweet").format(name=APP_NAME),
@@ -1165,23 +1215,3 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if self._autoread is None:
 			self._autoread = AutoReader(self)
 		self._autoread.toggle()
-
-	@script(
-		# Translators: Input help description for the command that loads new tweets. {name} is the add-on name.
-		description=_("{name}: update Home (the same as F5 in the main window)").format(name=APP_NAME),
-		category=APP_NAME,
-		gesture="kb:nvda+shift+f5",
-	)
-	def script_updateHome(self, gesture):
-		try:
-			self._ensure_backend()
-		except Exception:
-			log.error(TAG + "could not start", exc_info=True)
-			return
-		if self._active is None:
-			ui.message(_("Add an account first."))
-			return
-		if not self.start_job("reload", self._on_sync_result):
-			ui.message(_("Still loading, please wait."))
-			return
-		ui.message(_("Loading new tweets"))

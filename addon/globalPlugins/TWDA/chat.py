@@ -5,6 +5,7 @@
 # mark a conversation read, so what is read is kept on this computer only.
 
 import json
+import os
 import webbrowser
 
 import addonHandler
@@ -12,9 +13,10 @@ import ui
 import wx
 from logHandler import log
 
-from . import keymap, soundpack
+from . import attachments, keymap, soundpack, tabstate
 from .newchat import NewChatDialog
 from .utils import (
+	VirtualList,
 	TAG, announce_now, format_author, format_ts, is_relative_mode, safe_ui, truncate_cell, user_id_from_twid,
 )
 
@@ -60,6 +62,18 @@ def has_new_messages(convo, newest_known):
 	newer than the messages kept here: there is something to load that was not read."""
 	last = convo.get("last_id") or 0
 	return last > max(convo.get("read_id") or 0, convo.get("seen_id") or 0, newest_known or 0)
+
+
+def count_news(old, rows):
+	"""How many conversations of the inbox (rows) have an event newer than the cache had (old: conversation id ->
+	cached conversation). Requests and spam are not counted, and the first reading is not news."""
+	if not old:
+		return 0
+	return sum(
+		1 for c in rows
+		if c.get("trusted") and not c.get("low_quality")
+		and (old.get(c["convo_id"]) or {}).get("last_id", 0) != c.get("last_id")
+	)
 
 
 def filter_choices():
@@ -186,12 +200,14 @@ class MessageDialog(wx.Dialog):
 class ChatTab(wx.Panel):
 	TAB_KEY = "chat"
 
-	def __init__(self, parent, plugin):
+	def __init__(self, parent, plugin, only=None):
+		"""only: the id of the one conversation this tab shows (see ConvoTab); None for the whole Chat tab."""
 		super().__init__(parent)
 		self._plugin = plugin
 		self._cfg = plugin.config
 		self._aid = plugin.account_id()
 		self._dead = False
+		self._only = only
 		# Translators: Name of the Chat tab.
 		self.TAB_NAME = _("Chat")
 		# Translators: What the New button of the main window says in the Chat tab.
@@ -221,18 +237,22 @@ class ChatTab(wx.Panel):
 		sizer = wx.BoxSizer(wx.VERTICAL)
 		top = wx.BoxSizer(wx.HORIZONTAL)
 		# Translators: Label of the choice that filters the conversations of the Chat tab.
-		top.Add(wx.StaticText(self, label=_("&Filter:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+		self._filterLabel = wx.StaticText(self, label=_("&Filter:"))
+		top.Add(self._filterLabel, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 		self._filters = filter_choices()
 		self.filterChoice = wx.Choice(self, choices=[text for _key, text in self._filters])
 		top.Add(self.filterChoice, 0)
 		sizer.Add(top, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+		self._sizer, self._top = sizer, top  # ConvoTab hides the filter
 		split = wx.BoxSizer(wx.HORIZONTAL)
+		self._split = split  # and the list of conversations
 		self.tree = wx.TreeCtrl(self, style=wx.TR_HAS_BUTTONS | wx.TR_HIDE_ROOT | wx.TR_SINGLE | wx.TR_LINES_AT_ROOT)
 		# Translators: Accessible name of the list of conversations of the Chat tab.
 		self.tree.SetName(_("Conversations"))
 		self._root = self.tree.AddRoot(_("Conversations"))
 		split.Add(self.tree, 1, wx.EXPAND | wx.RIGHT, 5)
-		self.list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+		self._cell_cache = {}  # message id -> the cells of its row, built when the list asks
+		self.list = VirtualList(self, self._cell_text, wx.LC_SINGLE_SEL)
 		# Translators: Accessible name of the list of messages of the Chat tab.
 		self.list.SetName(_("Messages"))
 		self._build_columns()
@@ -402,22 +422,27 @@ class ChatTab(wx.Panel):
 		self._rows = list(reversed(self._messages)) if newest_first else list(self._messages)
 		self._build_columns()
 		self._quiet += 1
-		self.list.Freeze()
 		try:
-			self.list.DeleteAllItems()
-			for i, message in enumerate(self._rows):
-				cells = self._cells(message)
-				self.list.InsertItem(i, cells[0])
-				for col in range(1, len(cells)):
-					self.list.SetItem(i, col, cells[col])
+			self.list.DeleteAllItems()  # also drops the focus and the selection, which are kept by index
+			self._cell_cache.clear()
+			self.list.SetItemCount(len(self._rows))
 			if self._rows:
 				idx = next((i for i, m in enumerate(self._rows) if m["id"] == keep_id), 0 if newest_first else len(self._rows) - 1)
 				self.list.Focus(idx)
 				self.list.Select(idx)
 				self.list.EnsureVisible(idx)
 		finally:
-			self.list.Thaw()
 			self._quiet -= 1
+
+	def _cell_text(self, index, col):
+		"""The text of one cell, asked by the virtual list when it draws or reads it (NVDA asks cell by cell)."""
+		if not 0 <= index < len(self._rows):
+			return ""
+		message = self._rows[index]
+		cells = self._cell_cache.get(message["id"])
+		if cells is None:
+			cells = self._cell_cache[message["id"]] = self._cells(message)
+		return cells[col] if 0 <= col < len(cells) else ""
 
 	def _goto_index(self, idx):
 		"""Focus a message, say it and count it as read."""
@@ -552,8 +577,13 @@ class ChatTab(wx.Panel):
 
 	def _load_convos(self, keep_id=None):
 		self._convos = self._plugin.store.dm_load_convos(self._aid)
+		if self._only:
+			self._convos = [c for c in self._convos if c["convo_id"] == self._only]
 		self._refresh_counts()
-		self._visible = [c for c in self._convos if convo_visible(c, self._filter, self._flag(c))]
+		self._visible = (
+			list(self._convos) if self._only
+			else [c for c in self._convos if convo_visible(c, self._filter, self._flag(c))]
+		)
 		ids = [c["convo_id"] for c in self._visible]
 		wanted = keep_id or (self._current or {}).get("convo_id")
 		if wanted not in ids:
@@ -615,6 +645,8 @@ class ChatTab(wx.Panel):
 		self._item(menu, _("&Delete conversation..."), lambda: self._delete_convo(convo))
 		# Translators: Entry of the menu of a conversation in the Chat tab: what this add-on cannot show or do is done on the web page.
 		self._item(menu, _("Open on &x.com"), lambda: self._open_web(convo))
+		# Translators: Entry of the menu of a conversation in the Chat tab: the conversation in a tab of its own.
+		self._item(menu, _("Open in new &tab"), lambda: self.GetTopLevelParent().open_convo_tab(convo))
 		self.PopupMenu(menu)
 		menu.Destroy()
 
@@ -733,10 +765,14 @@ class ChatTab(wx.Panel):
 		writable = self._writable()
 		for control in (self.composeLabel, self.compose, self.sendButton):
 			control.Show(writable)
-		self.requestNotice.Show(bool(self._current) and not writable)
+			control.Enable(writable)  # a hidden control that stays enabled still haunts NVDA
+		notice = bool(self._current) and not writable
+		self.requestNotice.Show(notice)
+		self.requestNotice.Enable(notice)
 		replying = writable and self._reply_to is not None
-		self.replyLabel.Show(replying)
-		self.cancelReply.Show(replying)
+		for control in (self.replyLabel, self.cancelReply):
+			control.Show(replying)
+			control.Enable(replying)
 		self.Layout()
 
 	def _update_status(self):
@@ -810,7 +846,7 @@ class ChatTab(wx.Panel):
 	def refresh(self, done=None, quiet=False, full=False):
 		"""Read the list of conversations again: the first page, where the newest are, or with full every page (the
 		first time too). With done, stay silent and call done(changed) at the end."""
-		partial = not full and bool(self._convos)
+		partial = not full and (bool(self._convos) or quiet)  # a background check never reads every page
 		callback = lambda result: self.on_inbox(result, done, partial)
 		options = {"pages": 1} if partial else {}
 		if not self._plugin.start_job("dm_inbox", callback, options, progress=not quiet, background=quiet):
@@ -850,7 +886,7 @@ class ChatTab(wx.Panel):
 			self._own = result["own"]
 			store.set_account_meta(self._aid, OWN_KEY, self._own)
 		self._load_convos()
-		changed = any((old.get(c["convo_id"]) or {}).get("last_id") != c.get("last_id") for c in rows)
+		changed = count_news(old, rows)
 		if done:
 			done(changed)
 			return
@@ -1082,6 +1118,102 @@ class ChatTab(wx.Panel):
 		finally:
 			dlg.Destroy()
 
+	# Shortcut action (the ones of the tweet lists, set on the Shortcuts page) -> what it does with the attachment
+	_ATTACHMENT_KEYS = {
+		"open_image": "open", "open_video": "open", "bemyeyes": "bemyeyes", "copy_image": "copy", "download": "download",
+	}
+	_MEDIA_KINDS = {"image": "image", "video": "video", "gif": "video"}  # attachment kind -> kind of the download
+
+	def _attachment_menu(self, message):
+		"""The submenu with what can be done with the attachment of a message, or None when it has none."""
+		kind = (message.get("attachment") or {}).get("kind")
+		if kind not in ("image", "video", "gif", "tweet"):
+			return None
+		menu = wx.Menu()
+		if kind == "tweet":
+			# Translators: Entry of the Attachment submenu of a message: the tweet that was shared in the message.
+			self._item(menu, _("Open shared &tweet in browser"), lambda: self._attach_act(message, "open"))
+			return menu
+		self._item(menu, keymap.with_key(_("&Open"), "open_image" if kind == "image" else "open_video"),
+			lambda: self._attach_act(message, "open"))
+		if kind == "image":
+			self._item(menu, keymap.with_key(_("&Send to Be My Eyes"), "bemyeyes"), lambda: self._attach_act(message, "bemyeyes"))
+			self._item(menu, keymap.with_key(_("&Copy to clipboard"), "copy_image"), lambda: self._attach_act(message, "copy"))
+		self._item(menu, keymap.with_key(_("&Download..."), "download"), lambda: self._attach_act(message, "download"))
+		return menu
+
+	def _media_stem(self, message):
+		text = " ".join((message.get("text") or "").split())[:50]
+		return ("%s %s" % (self._sender_label(message), text)).strip()
+
+	def _attach_act(self, message, action):
+		"""action: open, bemyeyes, copy or download. The media is fetched through the service when it is not on this
+		computer yet (a message's media is not public), then the action runs on the file."""
+		attachment = message.get("attachment") or {}
+		kind, url = attachment.get("kind"), attachment.get("url")
+		if kind == "tweet":
+			link = attachment.get("link") or ""
+			if link.lower().startswith(("http://", "https://")):
+				webbrowser.open(link)
+				announce_now(_("Opening in the browser"))
+			else:
+				announce_now(_("This line is only information."))
+			return
+		if kind not in self._MEDIA_KINDS or not url:
+			# Translators: Announced when a media command is used on a message that has no image, video or GIF.
+			announce_now(_("This message has no media to open."))
+			return
+		if action in ("bemyeyes", "copy") and kind != "image":
+			# Translators: Announced when an image-only command is used on a video or GIF of a message.
+			announce_now(_("This works for images only."))
+			return
+		path = attachments.cached_media(url)
+		if path:
+			self._attach_done(path, action, kind)
+			return
+		options = {"url": url, "kind": self._MEDIA_KINDS[kind], "stem": self._media_stem(message)}
+		callback = lambda result: self.on_media(result, action, kind)
+		if not self._plugin.start_job("dm_media", callback, options):
+			announce_now(_("Still loading, please wait."))
+			return
+		announce_now(_("Downloading, please wait..."))
+
+	@safe_ui
+	def on_media(self, result, action, kind):
+		if not result["ok"]:
+			soundpack.play("error")
+			announce_now(_("Action failed: {error}").format(error=result["message"]))
+			return
+		if result.get("account_id") != self._aid:
+			return  # the account was switched meanwhile
+		self._attach_done(result["path"], action, kind)
+
+	def _attach_done(self, path, action, kind):
+		try:
+			if action == "open":
+				attachments.open_with_default_app(path)
+				text = _("Image opened.") if kind == "image" else _("Video opened.")
+			elif action == "bemyeyes":
+				if not attachments.send_to_bemyeyes(path):
+					raise OSError(_("Could not launch Be My Eyes. Is it installed?"))
+				text = _("Sent to Be My Eyes.")
+			elif action == "copy":
+				if not attachments.copy_image_to_clipboard(path):
+					raise OSError(_("Could not read the downloaded image."))
+				text = _("Image copied to clipboard.")
+			else:
+				folder = self._cfg.get("download_dir")
+				try:
+					os.makedirs(folder, exist_ok=True)
+				except OSError:
+					raise OSError(_("Could not create the download folder. Choose another one in the settings."))
+				text = _("Saved {name}").format(name=os.path.basename(attachments.move_to_folder(path, folder)))
+		except OSError as e:
+			soundpack.play("error")
+			announce_now(_("Action failed: {error}").format(error=e))
+			return
+		announce_now(text)
+
 	def _item(self, menu, label, callback):
 		item = menu.Append(wx.ID_ANY, label)
 		self.Bind(wx.EVT_MENU, lambda evt: callback(), item)
@@ -1105,6 +1237,10 @@ class ChatTab(wx.Panel):
 		self._item(menu, _("&Copy text"), lambda: self._copy(message.get("text") or "", _("Message text copied.")))
 		# Translators: Entry of the menu of a message in the Chat tab. The shortcut is added after the label.
 		self._item(menu, keymap.with_key(_("Show &full message..."), "full_tweet"), lambda: self._show_full(message))
+		attached = self._attachment_menu(message)
+		if attached is not None:
+			# Translators: Submenu of the message menu in the Chat tab: what can be done with the image, video, GIF or shared tweet of the message.
+			menu.AppendSubMenu(attached, _("&Attachment..."))
 		# Translators: Entry of the menu of a message in the Chat tab: deletes it for you only.
 		self._item(menu, _("&Delete for me..."), lambda: self._delete(message))
 		self.PopupMenu(menu)
@@ -1157,6 +1293,10 @@ class ChatTab(wx.Panel):
 			if keymap.matches(event, "copy_row"):
 				self._copy(self._row_text(message), _("Copied."))
 				return
+			for action_id, action in self._ATTACHMENT_KEYS.items():
+				if keymap.matches(event, action_id):
+					self._attach_act(message, action)
+					return
 			if key == wx.WXK_DELETE and plain:
 				self._delete(message)
 				return
@@ -1175,6 +1315,8 @@ class ChatTab(wx.Panel):
 
 	def onTabActivated(self):
 		ui.message(_("{name} tab").format(name=self.TAB_NAME))
+		if self._convos:
+			self._load_convos()  # a conversation tab may have read or loaded messages meanwhile
 		self._restoreFocusPosition()
 		store = self._plugin.store
 		if not store.get_account_meta(self._aid, NOTICE_KEY):
@@ -1229,11 +1371,128 @@ class ChatTab(wx.Panel):
 	def on_clock_timer(self, event):
 		if self._dead or not self.IsShownOnScreen():
 			return
-		for i, message in enumerate(self._rows):
-			self.list.SetItem(i, 4, self._time_text(message))
+		self._cell_cache.clear()  # the cells are built again, with the new times, when the list asks
+		count = min(len(self._rows), self.list.GetItemCount())
+		if count:
+			self.list.RefreshItems(0, count - 1)
 
 	def reload_display(self):
 		"""Settings changed: the labels and the cells are made again."""
 		self._cols = None
 		self._load_convos()
 		self._update_clock()
+
+
+class ConvoTab(ChatTab):
+	"""One conversation of the Chat tab in a removable tab of its own: the Chat tab with the filter and the list
+	of conversations hidden. Like the other removable tabs it is remembered across sessions, comes back with
+	Ctrl+Shift+T and returns to the tab it was opened from. The messages are kept in the account's cache, so it
+	shows what the cache holds; F5 and Shift+F5 ask X for more, as in the Chat tab."""
+
+	TAB_KEY = None
+	TAB_TEMP_TYPE = "convo"
+	on_new = None  # the New button makes a tweet here: chats are started in the Chat tab
+
+	def __init__(self, parent, plugin, convo_id, name, origin_key=None):
+		super().__init__(parent, plugin, only=convo_id)
+		self.TAB_TEMP_KEY = convo_id
+		self._originTabKey = origin_key
+		self._tab_aid = self._aid
+		self.TAB_NAME = name
+		self.NEW_LABEL = None
+		# The filter and the list of conversations have no place in this tab. Hiding a control is not enough: a
+		# hidden control that is still enabled haunts its neighbours (the list of messages was read as "Filter:").
+		# The filter is removed for good; the list of conversations, which the code still uses, is hidden and disabled.
+		self._filterLabel.Destroy()
+		self.filterChoice.Destroy()
+		self._sizer.Show(self._top, False, True)
+		self._split.Hide(self.tree)
+		self.tree.Enable(False)
+		self.Layout()
+
+	# what the Chat tab keeps about its own place must not be overwritten by this tab
+	def _saved_state(self):
+		return {}
+
+	def _remember_soon(self):
+		pass
+
+	def flush_state(self):
+		pass
+
+	def snapshot(self):
+		return []  # nothing to keep: the messages are in the account's cache
+
+	def _current_post_id(self):
+		return None
+
+	def refresh(self, done=None, quiet=False, full=False):
+		if done is not None:  # Ctrl+F5 and the background checks leave a conversation alone: only F5 asks X
+			done(False)
+			return True
+		self.onCheckForUpdates()
+		return True
+
+	def onCheckForUpdates(self, evt=None):
+		if self._current is None:
+			# Translators: Announced by F5 in a conversation tab when the conversation is not in the list of the Chat tab any more.
+			ui.message(_("This conversation is not in the list any more. Close this tab and open it again from the Chat tab."))
+			return
+		self._fetch_history(self._current, "refresh")
+
+	def onTabActivated(self):
+		ui.message(_("{name} tab").format(name=self.TAB_NAME))
+		self._load_convos(self._only)  # the Chat tab may have changed the conversation meanwhile
+		self._restoreFocusPosition()
+		if self._current is not None and self._only not in self._fetched and not self._messages:
+			self._fetch_history(self._current, "first")
+
+	def _restoreFocusPosition(self, moveFocus=True):
+		if not moveFocus:
+			return
+		if self._rows:
+			self._parked = False
+			self.list.SetFocus()
+		elif self._writable():
+			self._parked = False
+			self.compose.SetFocus()
+		else:
+			self._parked = True
+			button = getattr(self.GetTopLevelParent(), "checkUpdatesButton", None)
+			if button is not None:
+				button.SetFocus()
+
+	def _leave_toolbar_button(self):
+		"""Focus waited on the toolbar button because there was nothing to show: now there are messages."""
+		if not self._parked or not self._rows:
+			return
+		button = getattr(self.GetTopLevelParent(), "checkUpdatesButton", None)
+		try:
+			if button is not None and self.IsShownOnScreen() and self.FindFocus() is button:
+				self._parked = False
+				self.list.SetFocus()
+		except RuntimeError:
+			pass
+
+	@safe_ui
+	def on_escape(self):
+		"""Escape in the box that writes a message leaves it for the messages (there is no list of conversations)."""
+		if self.FindFocus() is self.compose:
+			if self._rows:
+				self.list.SetFocus()
+			return True
+		return False
+
+	def onTabRemoved(self):
+		self._dead = True
+		for value in vars(self).values():
+			if isinstance(value, wx.Timer):
+				value.Stop()
+		store = self._plugin.store
+		tabstate.remove_open_tab(store, self._tab_aid, "convo", self.TAB_TEMP_KEY)
+		tabstate.delete_cache(store, self._tab_aid, "convo", self.TAB_TEMP_KEY)
+		self.GetTopLevelParent().jump_to_permanent(self._originTabKey)
+
+	def onTabRenamed(self, new_name):
+		self.TAB_NAME = new_name
+		tabstate.set_tab_name(self._plugin.store, self._tab_aid, "convo", self.TAB_TEMP_KEY, new_name)

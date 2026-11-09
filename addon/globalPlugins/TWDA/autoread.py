@@ -22,7 +22,9 @@ from speech.commands import CallbackCommand, ConfigProfileTriggerCommand
 from synthDriverHandler import synthDoneSpeaking
 
 from . import soundpack, tabstate
-from .utils import FOCUS_KEY, TAG, cell_texts, is_pinned, row_sound_events, row_speech
+from .utils import (
+	FOCUS_KEY, TAG, cell_texts, is_pinned, parse_timeline_filter, post_passes, row_sound_events, row_speech,
+)
 
 try:
 	from speech.extensions import pre_speech, pre_speechCanceled
@@ -313,11 +315,23 @@ class AutoReader:
 		texts = cell_texts(post, cfg.get("author_mode"), cfg.get("time_mode"), cfg.get("time_pattern"), full=full)
 		return row_speech(texts, columns), row_sound_events(post, full=full), False
 
+	def _filter_of(self, aid, kind, key):
+		"""The test of the filters a tab has (they are kept by the identity of the tab), or None."""
+		name = "tabfilter:" + key if kind == "permanent" else "tabfilter:%s:%s" % (kind, key)
+		states = parse_timeline_filter(self._plugin.store.get_account_meta(aid, name))
+		return (lambda post: post_passes(post, states)) if states else None
+
 	def _next_home(self, aid):
 		store = self._plugin.store
-		post = store.oldest_unread(aid)
-		if post is None:
-			return None
+		passes = self._filter_of(aid, "permanent", "home")
+		post, after = None, 0
+		while True:  # the tweets the filter hides stay unread: they are skipped, not read
+			post = store.oldest_unread(aid, after)
+			if post is None:
+				return None
+			if passes is None or passes(post):
+				break
+			after = post.id
 		store.mark_read(aid, [post.id], True)
 		store.set_account_meta(aid, FOCUS_KEY, str(post.id))  # where the reader is when the window opens again
 		self._plugin.tray_refresh()
@@ -329,6 +343,7 @@ class AutoReader:
 		kind, key = identity["kind"], identity["key"]
 		if kind == "users":
 			return None  # a list of users has no tweets
+		passes = self._filter_of(aid, kind, key)
 		if kind == "permanent":
 			if key == "home":
 				return self._next_home(aid)
@@ -346,7 +361,7 @@ class AutoReader:
 			scan = posts  # top to bottom: the tweet that started it, then the replies
 		else:
 			scan = list(reversed(posts))  # quotes, bookmarks: given newest first
-		pick = next((p for p in scan if not p.is_read), None)
+		pick = next((p for p in scan if not p.is_read and (passes is None or passes(p))), None)
 		if pick is None:
 			return None
 		pick.is_read = True

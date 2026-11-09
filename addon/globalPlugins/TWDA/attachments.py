@@ -147,6 +147,34 @@ def fetch_media(url, kind, stem):
 	return path
 
 
+def cached_media(url):
+	"""The temp file of a media URL fetched before, or None."""
+	with _cache_lock:
+		path = _cache.get(url)
+	return path if path and os.path.isfile(path) else None
+
+
+def store_media(url, data, content_type, kind, stem):
+	"""Writes media that was downloaded elsewhere (the logged in client of the service: a direct message's media is
+	not public) into the temp folder under a readable name and remembers it. kind is image or video. Raises OSError
+	when the content type is not one we know. Returns the path."""
+	content_type = (content_type or "").split(";")[0].strip().lower()
+	if kind == "image":
+		suffix = _IMAGE_SUFFIX.get(content_type)
+	else:
+		suffix = ".mp4" if content_type.startswith("video/") or content_type == "application/octet-stream" else None
+	if suffix is None:
+		raise OSError(_("Unexpected content type: {type}").format(type=content_type or "?"))
+	final = _unique_path(_temp_dir(), safe_name(stem), suffix)
+	with open(final, "wb") as f:
+		f.write(data)
+	if suffix == ".webp":
+		final = _webp_to_png(final)
+	with _cache_lock:
+		_cache[url] = final
+	return final
+
+
 def move_to_folder(path, folder):
 	"""Move the temp file to the download folder (copy it if it is in use). Returns the new path."""
 	os.makedirs(folder, exist_ok=True)

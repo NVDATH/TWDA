@@ -10,7 +10,7 @@ import wx
 from logHandler import log
 
 from . import keymap, soundpack, tabstate
-from .chat import ChatTab
+from .chat import ChatTab, ConvoTab
 from .explore import ExploreTab
 from .feedlist import TweetPanel
 from .userstab import PeopleTab, UsersTab
@@ -38,7 +38,6 @@ class HomePanel(TweetPanel):
 
 	TAB_KEY = "home"
 	CAN_OLDER = True
-	VIRTUAL = True  # the list holds no rows (feedlist.VirtualList); False goes back to the normal list
 
 	def __init__(self, parent, plugin):
 		super().__init__(parent, plugin)
@@ -47,6 +46,7 @@ class HomePanel(TweetPanel):
 		self._pending_focus = None  # (account id, tweet id)
 		self._focus_timer = wx.Timer(self)
 		self.Bind(wx.EVT_TIMER, self.on_focus_timer, self._focus_timer)
+		self._load_filter(self._aid())
 		self.load_cached()
 
 	# ---- cache and remembered place
@@ -74,7 +74,7 @@ class HomePanel(TweetPanel):
 		self._select(idx if idx >= 0 else self._top_index())
 
 	def initial_announce(self):
-		if not len(self._posts) and not self._plugin.busy:
+		if not len(self._all_rows()) and not self._plugin.busy:
 			key = keymap.display("check_updates")
 			if key:
 				# Translators: Announced when the Home tab has nothing saved. {key} is the shortcut that checks for updates.
@@ -160,7 +160,7 @@ class HomePanel(TweetPanel):
 		ui.message(text)
 
 	def onFetchOlder(self):
-		if not len(self._posts):
+		if not len(self._all_rows()):
 			ui.message(_("Nothing loaded yet."))
 			return
 		if not self._plugin.start_job("older", self.on_older_result):
@@ -224,6 +224,7 @@ class TempTab:
 		self._read_dirty = False  # read state or flags changed since the tab's cache was written
 		self._focus_timer = wx.Timer(self)
 		self.Bind(wx.EVT_TIMER, self._on_focus_timer, self._focus_timer)
+		self._load_filter(self._tab_aid)
 
 	def _focus_key(self):
 		return "tabfocus:%s:%s" % (self.TAB_TEMP_TYPE, self.TAB_TEMP_KEY)
@@ -277,13 +278,13 @@ class TempTab:
 
 	def _carry_read(self, posts):
 		"""A refreshed copy of a tweet the tab already shows keeps its read state."""
-		old = {p.id: p.is_read for p in self._posts.rows}
+		old = {p.id: p.is_read for p in self._all_rows()}
 		for p in posts:
 			if p.id in old:
 				p.is_read = old[p.id]
 
 	def _persist_posts(self):
-		rows = list(self._posts.rows)
+		rows = list(self._all_rows())
 		if getattr(self._posts, "flipped", False):
 			rows.reverse()  # the cache keeps the order the tab was given, not the one the reader chose
 		tabstate.set_cache(self._plugin.store, self._tab_aid, self.TAB_TEMP_TYPE, self.TAB_TEMP_KEY, rows)
@@ -297,6 +298,7 @@ class TempTab:
 		tabstate.remove_open_tab(store, self._tab_aid, self.TAB_TEMP_TYPE, self.TAB_TEMP_KEY)
 		tabstate.delete_cache(store, self._tab_aid, self.TAB_TEMP_TYPE, self.TAB_TEMP_KEY)
 		store.set_account_meta(self._tab_aid, self._focus_key(), "")
+		store.set_account_meta(self._tab_aid, self._filter_key(), "")
 		self.GetTopLevelParent().jump_to_permanent(self._originTabKey)
 
 	def onTabRenamed(self, new_name):
@@ -324,12 +326,14 @@ class TempTab:
 				done(False)
 			return
 		posts = result["posts"]
-		changed = [p.id for p in posts] != [p.id for p in self._posts.rows]
+		changed = [p.id for p in posts] != [p.id for p in self._all_rows()]
+		shown = {p.id for p in self._all_rows()}
+		new = sum(1 for p in posts if p.id not in shown and self._shows(p))
 		keep_id = self._current_post_id()
 		self._show(posts, keep_id)
 		self._persist_posts()
 		if done:
-			done(changed)
+			done(new or changed)  # how many are new; True when only the order or the list changed
 			return
 		text = self._count_text(len(posts))
 		if result.get("limited"):
@@ -338,17 +342,17 @@ class TempTab:
 
 	def snapshot(self):
 		"""The tweets in the order the tab was given (what its cache holds), as they are now."""
-		rows = list(self._posts.rows)
+		rows = list(self._all_rows())
 		if getattr(self._posts, "flipped", False):
 			rows.reverse()
 		return rows
 
 	def _load_more(self, kind, options, loading_text):
 		"""Shift+F5: the next page after what the tab shows; the new tweets go to the far end."""
-		if not len(self._posts):
+		if not len(self._all_rows()):
 			ui.message(_("Nothing loaded yet."))
 			return
-		options = dict(options, more=True, have=[p.id for p in self._posts.rows])
+		options = dict(options, more=True, have=[p.id for p in self._all_rows()])
 		if not self._plugin.start_job(kind, self.on_more_result, options):
 			ui.message(_("Still loading, please wait."))
 			return
@@ -373,6 +377,7 @@ class TempTab:
 class ThreadPanel(TempTab, TweetPanel):
 	"""Ancestors, the tweet and its replies."""
 
+	FILTER_KEYS = tuple(k for k in TweetPanel.FILTER_KEYS if k not in ("retweets", "replies"))  # hiding the replies of a thread would break it
 	TRACKS_UNREAD = True
 	SUPPORTS_NTH = True
 	SORTED = False
@@ -501,10 +506,10 @@ class FeedTab(TempTab, TweetPanel):
 			"pages": self._cfg.get("feed_pages"),
 		}
 		if older:
-			options["have"] = [p.id for p in self._posts.rows]
-		elif self.SORTED and len(self._posts):
-			options["known"] = [p.id for p in self._posts.rows]  # the refresh reads pages until it meets these
-			options["pinned"] = [p.id for p in self._posts.rows if is_pinned(p)]  # not an overlap, see service._feed
+			options["have"] = [p.id for p in self._all_rows()]
+		elif self.SORTED and len(self._all_rows()):
+			options["known"] = [p.id for p in self._all_rows()]  # the refresh reads pages until it meets these
+			options["pinned"] = [p.id for p in self._all_rows() if is_pinned(p)]  # not an overlap, see service._feed
 		return options
 
 	def _summary(self, new, total):
@@ -516,7 +521,7 @@ class FeedTab(TempTab, TweetPanel):
 
 	def onTabActivated(self):
 		super().onTabActivated()
-		if not self._tried and not len(self._posts):
+		if not self._tried and not len(self._all_rows()):
 			self._tried = True
 			self.refresh()
 
@@ -537,20 +542,16 @@ class FeedTab(TempTab, TweetPanel):
 			return
 		if result.get("uid") and not self._params.get("uid"):
 			self._params["uid"] = result["uid"]
-		old = [p.id for p in self._posts.rows]
+		old = [p.id for p in self._all_rows()]
 		posts = result["posts"]
 		keep_id = self._current_post_id()
 		self._show(posts, keep_id)
 		self._persist_posts()
-		if self.SORTED:
-			known = set(old)
-			new = sum(1 for p in posts if p.id not in known)
-			changed = new > 0
-		else:
-			new = 0
-			changed = [p.id for p in self._posts.rows] != old
+		known = set(old)
+		new = sum(1 for p in posts if p.id not in known and self._shows(p))
+		changed = new > 0 if self.SORTED else [p.id for p in self._all_rows()] != old
 		if done:
-			done(changed)
+			done(new or changed)  # how many are new; True when only the order or the list changed
 			return
 		text = self._summary(new, len(self._posts))
 		if result.get("gap"):
@@ -560,7 +561,7 @@ class FeedTab(TempTab, TweetPanel):
 		ui.message(text)
 
 	def onClearCache(self):
-		if not len(self._posts):
+		if not len(self._all_rows()):
 			ui.message(_("Nothing to clear."))
 			return
 		confirm = wx.MessageDialog(
@@ -583,7 +584,7 @@ class FeedTab(TempTab, TweetPanel):
 
 	def merge_bg(self, posts):
 		"""A background check found these tweets: add the ones this tab does not have. Returns how many."""
-		known = {p.id for p in self._posts.rows}
+		known = {p.id for p in self._all_rows()}
 		fresh = [p for p in posts if p.id not in known]
 		if not fresh:
 			return 0
@@ -591,7 +592,7 @@ class FeedTab(TempTab, TweetPanel):
 		if self.SORTED:
 			self._add_posts(fresh, fresh=False)
 		else:
-			current = list(self._posts.rows)
+			current = list(self._all_rows())
 			if getattr(self._posts, "flipped", False):
 				current.reverse()
 			rows = fresh + current  # the order the tab was given: the new ones on top
@@ -599,10 +600,10 @@ class FeedTab(TempTab, TweetPanel):
 			self._add_posts(rows, fresh=False)
 		self._restore_place(keep_id)
 		self._persist_posts()
-		return len(fresh)
+		return sum(1 for p in fresh if self._shows(p))
 
 	def onFetchOlder(self):
-		if not len(self._posts):
+		if not len(self._all_rows()):
 			ui.message(_("Nothing loaded yet."))
 			return
 		if not self._plugin.start_job("feed", self.on_older_result, self._options(older=True)):
@@ -636,12 +637,12 @@ class BookmarksTab(FeedTab):
 	def _drop(self, post):
 		"""An unbookmarked tweet leaves this list."""
 		idx = self._posts.index_of(post.id)
-		rows = [p for p in self._posts.rows if p.id != post.id]
+		rows = [p for p in self._all_rows() if p.id != post.id]
 		self._reset_list()
 		self._add_posts(rows, fresh=False)
 		self._persist_posts()
-		if rows:
-			self._select(min(max(idx, 0), len(rows) - 1))
+		if len(self._posts):
+			self._select(min(max(idx, 0), len(self._posts) - 1))
 		else:
 			self._restoreFocusPosition()
 
@@ -671,6 +672,7 @@ class UserTab(FeedTab):
 
 class SearchTab(FeedTab):
 	SOURCE = "search"
+	FILTERABLE = False  # the search itself filters, and Edit search changes it (same key as the filter of the other tabs)
 
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
@@ -681,7 +683,29 @@ class SearchTab(FeedTab):
 		self.Layout()
 
 	def edit_search(self):
-		self.GetTopLevelParent().edit_search(self._params)
+		self.GetTopLevelParent().edit_search(self._params, self.TAB_TEMP_KEY, self.TAB_NAME)
+
+	def retarget(self, key, params, name, posts):
+		"""The search of this tab was edited: the tab keeps its place and shows the new search. Its key, name and
+		tweets are the new ones; what was kept for the old key (saved tweets, reading place, own settings) moves
+		or goes."""
+		store, aid, old = self._plugin.store, self._tab_aid, self.TAB_TEMP_KEY
+		self._focus_timer.Stop()
+		self._focus_pending, self._read_dirty = None, False
+		tabstate.remove_open_tab(store, aid, self.TAB_TEMP_TYPE, old)
+		tabstate.delete_cache(store, aid, self.TAB_TEMP_TYPE, old)
+		store.set_account_meta(aid, self._focus_key(), "")
+		self._plugin.move_tab_settings("search:%s" % old, "search:%s" % key)
+		self.TAB_TEMP_KEY = key
+		self.TAB_NAME = name
+		self._params = dict(params)
+		tabstate.add_open_tab(store, aid, {
+			"type": self.TAB_TEMP_TYPE, "key": key, "params": self._params, "origin": self._originTabKey, "name": name,
+		})
+		tabstate.set_cache(store, aid, self.TAB_TEMP_TYPE, key, posts)
+		self._reset_list()
+		self._show(posts, None)
+		self._tried = True
 
 
 class ListTab(FeedTab):
@@ -715,6 +739,8 @@ def make_temp_tab(parent, plugin, entry, posts):
 		)
 	if kind == "users" and (entry.get("params") or {}).get("kind") and (entry.get("params") or {}).get("handle"):
 		return UsersTab(parent, plugin, entry["params"], posts, entry.get("name") or key, origin_key=entry.get("origin"))
+	if kind == "convo":
+		return ConvoTab(parent, plugin, key, entry.get("name") or key, origin_key=entry.get("origin"))
 	return None
 
 
@@ -904,6 +930,8 @@ def build_tabs(main, plugin):
 				main.notebook, plugin, entry["params"], posts, entry.get("name") or key,
 				origin_key=entry.get("origin"),
 			)
+		elif kind == "convo":
+			panel = ConvoTab(main.notebook, plugin, key, entry.get("name") or key, origin_key=entry.get("origin"))
 		else:
 			tabstate.remove_open_tab(store, aid, kind, key)
 			continue

@@ -26,7 +26,7 @@ from . import keymap
 
 addonHandler.initTranslation()
 
-APP_NAME = "tweetAccess"  # the one place that names the add-on
+APP_NAME = "TWDA"  # the one place that names the add-on
 TAG = APP_NAME + ": "
 
 ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -100,6 +100,23 @@ class Post:
 			if name != "id" and name in data:
 				setattr(post, name, data[name])
 		return post
+
+
+class VirtualList(wx.ListCtrl):
+	"""A report list that holds no rows: the text of a cell is asked of its owner when the control draws or
+	reads it, so filling it costs nothing per row. InsertItem and SetItem must not be used on it.
+	cell_text(row index, column index) -> text; style: more list styles, such as wx.LC_SINGLE_SEL."""
+
+	def __init__(self, parent, cell_text, style=0):
+		super().__init__(parent, style=wx.LC_REPORT | wx.LC_VIRTUAL | style)
+		self._cell_text = cell_text
+
+	def OnGetItemText(self, item, col):
+		return self._cell_text(item, col)
+
+	def DeleteAllItems(self):
+		self.SetItemCount(0)
+		return True
 
 
 def safe_ui(func):
@@ -364,9 +381,109 @@ def relevant_users(post):
 		add(handle_of(post.author), _("@{user} (retweeted by)"))
 	add((post.reply_to or "").lower(), _("@{user} (replying to)"))
 	add(handle_of(post.quote_author), _("@{user} (quoted author)"))
-	for name in mentions_of(post.message):
+	# X cuts the leading mentions of a reply from its text: the list it sent with the tweet has them all
+	for name in [str(m).lower() for m in load_stats(post.stats).get("mentions") or []] + mentions_of(post.message):
 		add(name, _("@{user} (mentioned)"))
+	for name in mentions_of(post.quote_text):
+		# Translators: Role of a user in the "which user?" list: named in the text of the tweet that a quote tweet quotes. {user} is the user name.
+		add(name, _("@{user} (mentioned in the quoted tweet)"))
 	return users
+
+
+TIMELINE_FILTERS = ("retweets", "replies", "quotes", "images", "videos", "gifs", "links", "sensitive")
+
+
+def timeline_filter_choices():
+	"""(key, text) of the kinds of tweet a tab can show or hide, in the order of the filter window."""
+	return [
+		# Translators: Kind of tweet in the filter window of a tab (shown or hidden).
+		("retweets", _("Retweets")),
+		# Translators: Kind of tweet in the filter window of a tab (shown or hidden).
+		("replies", _("Replies")),
+		# Translators: Kind of tweet in the filter window of a tab (shown or hidden).
+		("quotes", _("Quote tweets")),
+		# Translators: Kind of tweet in the filter window of a tab (shown or hidden): tweets with a picture.
+		("images", _("Tweets with images")),
+		# Translators: Kind of tweet in the filter window of a tab (shown or hidden): tweets with a video.
+		("videos", _("Tweets with videos")),
+		# Translators: Kind of tweet in the filter window of a tab (shown or hidden): tweets with an animated GIF.
+		("gifs", _("Tweets with animated GIFs")),
+		# Translators: Kind of tweet in the filter window of a tab (shown or hidden): tweets with a link.
+		("links", _("Tweets with links")),
+		# Translators: Kind of tweet in the filter window of a tab (shown or hidden): tweets X marks as possibly sensitive.
+		("sensitive", _("Tweets marked as sensitive")),
+	]
+
+
+FILTER_STATES = ("show", "hide", "only")
+
+
+def timeline_filter_state_names():
+	"""{state: text} of the three settings of a kind of tweet in the filter window."""
+	return {
+		# Translators: Setting of a kind of tweet in the filter window of a tab: those tweets show (the default).
+		"show": _("Show"),
+		# Translators: Setting of a kind of tweet in the filter window of a tab: those tweets are hidden.
+		"hide": _("Hide"),
+		# Translators: Setting of a kind of tweet in the filter window of a tab: only tweets of the kinds set to this show.
+		"only": _("Show only"),
+	}
+
+
+def parse_timeline_filter(raw):
+	"""{kind: "hide" or "only"} from a saved text such as "images:only,retweets:hide" (a bare name means hide). A
+	kind that is shown has no entry, and a name this version does not know is dropped."""
+	states = {}
+	for part in (raw or "").split(","):
+		key, _sep, state = part.strip().partition(":")
+		state = state or "hide"
+		if key in TIMELINE_FILTERS and state in ("hide", "only"):
+			states[key] = state
+	return states
+
+
+def format_timeline_filter(states):
+	"""The saved text of a filter: the kinds that are not shown, in the order of TIMELINE_FILTERS."""
+	return ",".join("%s:%s" % (k, states[k]) for k in TIMELINE_FILTERS if states.get(k) in ("hide", "only"))
+
+
+def post_kinds(post):
+	"""The kinds of tweet (keys of TIMELINE_FILTERS) this tweet is."""
+	kinds = set()
+	if post.kind == "retweet":
+		kinds.add("retweets")
+	if post.reply_to:
+		kinds.add("replies")
+	if post.quote_text:
+		kinds.add("quotes")
+	for item in load_embeds(post.embeds):
+		kind = {"image": "images", "video": "videos", "gif": "gifs", "link": "links"}.get(item["t"])
+		if kind:
+			kinds.add(kind)
+	if load_stats(post.stats).get("sensitive") is True:
+		kinds.add("sensitive")
+	return kinds
+
+
+def post_passes(post, states):
+	"""Whether a tweet shows under these settings (states: {kind: "hide" or "only"}). A tweet of a hidden kind is
+	hidden. When some kinds are set to show only, a tweet must be at least one of them. Hiding wins over showing."""
+	if not states:
+		return True
+	kinds = post_kinds(post)
+	if any(state == "hide" and key in kinds for key, state in states.items()):
+		return False
+	only = [key for key, state in states.items() if state == "only"]
+	return not only or any(key in kinds for key in only)
+
+
+def reply_all_handles(post, own=""):
+	"""User names (no @, lowercase) to put in front of a reply to everybody: every user the tweet is about (see
+	relevant_users: who retweeted it, who it replies to, the author of the tweet it quotes, the users it mentions),
+	without its author (the reply already goes to them: a retweet is answered at the original tweet) and without
+	the account itself."""
+	skip = {author_handle(post), (own or "").lower()}
+	return [user for _label, user in relevant_users(post) if user not in skip]
 
 
 def tweet_length(text):

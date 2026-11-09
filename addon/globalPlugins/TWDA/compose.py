@@ -25,7 +25,7 @@ MAX_BYTES = {"image": 5 * 1024 * 1024, "gif": 15 * 1024 * 1024, "video": 512 * 1
 
 
 class ComposeDialog(wx.Dialog):
-	def __init__(self, parent, plugin, onClosed=None, reply_to=None, quote_of=None):
+	def __init__(self, parent, plugin, onClosed=None, reply_to=None, quote_of=None, prefill=""):
 		# reply_to / quote_of: the Post being answered or quoted (only one of them).
 		if reply_to:
 			# Translators: Compose window title when replying. {user} is the user name replied to.
@@ -74,6 +74,7 @@ class ComposeDialog(wx.Dialog):
 		self.charGauge = wx.Gauge(self, range=POST_MAX_LENGTH, size=(400, 20))
 		sizer.Add(self.charGauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 10)
 		self.charGauge.Hide()
+		self.charGauge.Enable(False)
 		self.charCountLabel = wx.StaticText(self, label="")
 		sizer.Add(self.charCountLabel, 0, wx.LEFT | wx.TOP, 5)
 		self.statusLabel = wx.StaticText(self, label="")
@@ -93,6 +94,7 @@ class ComposeDialog(wx.Dialog):
 		sizer.Add(self.removeButton, 0, wx.LEFT | wx.TOP, 10)
 		for control in (self.attachLabel, self.attachList, self.removeButton):
 			control.Hide()
+			control.Enable(False)
 
 		# Translators: Button that posts the tweet. The shortcut is added after the label.
 		self.postButton = wx.Button(self, label=keymap.with_key(_("&Post"), "send_tweet"))
@@ -110,6 +112,9 @@ class ComposeDialog(wx.Dialog):
 		self.cancelButton.Bind(wx.EVT_BUTTON, lambda e: self.Close())
 		self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
 		self.Bind(wx.EVT_CLOSE, self.onCloseEvent)
+		if prefill:
+			self.textCtrl.SetValue(prefill)
+			self.textCtrl.SetInsertionPointEnd()
 		self._update_title()
 		self.textCtrl.SetFocus()
 
@@ -152,6 +157,7 @@ class ComposeDialog(wx.Dialog):
 		if length > POST_MAX_LENGTH:
 			soundpack.play("max_length")  # on every change while over the limit, not only the first
 		self.charGauge.Show(length > 0)
+		self.charGauge.Enable(length > 0)
 		if length > 0:
 			self.charGauge.SetValue(min(length, POST_MAX_LENGTH))
 			self.charCountLabel.SetLabel("%d / %d" % (length, POST_MAX_LENGTH))
@@ -326,6 +332,7 @@ class ComposeDialog(wx.Dialog):
 		shown = bool(labels)
 		for control in (self.attachLabel, self.attachList, self.removeButton):
 			control.Show(shown)
+			control.Enable(shown)
 		if shown:
 			self.attachList.SetSelection(max(0, min(select, len(labels) - 1)))
 		self.Layout()

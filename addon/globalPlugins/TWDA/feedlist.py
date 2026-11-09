@@ -22,9 +22,11 @@ import gui.nvdaControls
 from . import attachments, keymap, soundpack
 from .dialogs import FullTextDialog
 from .utils import (
-	TAG, announce_now, author_handle, cell_texts, copy_text, format_ts, handle_of, hashtags_of,
+	TAG, VirtualList, announce_now, author_handle, cell_texts, copy_text, handle_of, hashtags_of,
 	is_pinned, is_relative_mode, is_retweeted, links_of, load_embeds, message_text, post_involves,
-	quoted_post, row_sound_events, row_speech, safe_ui, set_stat, target_id,
+	quoted_post, reply_all_handles, row_sound_events, row_speech, safe_ui, set_stat, target_id,
+	FILTER_STATES, TIMELINE_FILTERS, format_timeline_filter, parse_timeline_filter, post_passes, timeline_filter_choices,
+	timeline_filter_state_names,
 )
 
 addonHandler.initTranslation()
@@ -107,6 +109,126 @@ class SequencePosts:
 		return -1
 
 
+class FilteredPosts:
+	"""The tweets a tab shows: a view over its OrderedPosts or SequencePosts (data) that leaves out the tweets the
+	filter hides. It answers like them (rows, len, index_of, newest_first, flipped), so the code of the list works
+	on what is shown; data holds every tweet, for the code that saves, refreshes and pages. The view is made again
+	by refresh(), after tweets were added to data. Without a filter rows is data's own list."""
+
+	def __init__(self, data, predicate=None):
+		self.data = data
+		self._predicate = predicate
+		self.rows = data.rows
+		self._pos = None
+		self.refresh()
+
+	def __getattr__(self, name):  # newest_first, flipped, pinned: whatever data has
+		return getattr(self.__dict__["data"], name)
+
+	def __len__(self):
+		return len(self.rows)
+
+	def refresh(self):
+		if self._predicate is None:
+			self.rows, self._pos = self.data.rows, None
+		else:
+			self.rows = [p for p in self.data.rows if self._predicate(p)]
+			self._pos = {p.id: i for i, p in enumerate(self.rows)}
+
+	def add(self, post, older=False):
+		return self.data.add(post, older)  # callers refresh() once after adding
+
+	def index_of(self, post_id):
+		if self._pos is None:
+			return self.data.index_of(post_id)
+		return self._pos.get(post_id, -1)
+
+
+class TimelineFilterDialog(wx.Dialog):
+	"""A list of the kinds of tweet a tab can filter, each with its setting: Show (the default), Hide or Show only.
+	Enter or Space on a kind goes to its next setting. keys: the kinds this tab can filter.
+	picked() gives {kind: "hide" or "only"} after OK."""
+
+	def __init__(self, parent, states, keys):
+		# Translators: Title of the window that sets the filter of a tab of tweets.
+		super().__init__(parent, title=_("Filter tweets"), size=(520, 440))
+		self._kinds = [(key, text) for key, text in timeline_filter_choices() if key in keys]
+		self._names = timeline_filter_state_names()
+		self._states = dict(states)
+		sizer = wx.BoxSizer(wx.VERTICAL)
+		# Translators: Label of the list of kinds of tweet in the filter window. Each kind has a setting.
+		sizer.Add(wx.StaticText(self, label=_("&Kinds of tweets (Enter or Space changes the setting):")), 0, wx.ALL, 10)
+		self.list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+		# Translators: Column headers of the list of kinds of tweet in the filter window.
+		self.list.InsertColumn(0, _("Kind of tweet"), width=280)
+		self.list.InsertColumn(1, _("Setting"), width=150)
+		sizer.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+		# Translators: Button of the filter window that sets every kind of tweet back to Show, so nothing is filtered.
+		self.reset_btn = wx.Button(self, label=_("&Reset to show all kinds"))
+		sizer.Add(self.reset_btn, 0, wx.ALL, 10)
+		sizer.Add(self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALIGN_CENTER | wx.BOTTOM, 10)
+		self.SetSizer(sizer)
+		self.CentreOnParent()
+		self.list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_cycle)
+		self.list.Bind(wx.EVT_LIST_KEY_DOWN, self.on_key)
+		self.reset_btn.Bind(wx.EVT_BUTTON, self.on_reset)
+		self._render(0)
+		self.list.SetFocus()
+
+	def _render(self, target):
+		"""Fill the list again; the focus goes to row target."""
+		self.list.Freeze()
+		try:
+			self.list.DeleteAllItems()
+			for i, (key, text) in enumerate(self._kinds):
+				self.list.InsertItem(i, text)
+				self.list.SetItem(i, 1, self._names[self._states.get(key, "show")])
+			if self._kinds:
+				target = max(0, min(target, len(self._kinds) - 1))
+				self.list.Focus(target)
+				self.list.Select(target)
+		finally:
+			self.list.Thaw()
+
+	def _current(self):
+		index = self.list.GetFocusedItem()
+		return index if 0 <= index < len(self._kinds) else -1
+
+	def _set(self, state):
+		index = self._current()
+		if index < 0:
+			return
+		key = self._kinds[index][0]
+		if state == "show":
+			self._states.pop(key, None)
+		else:
+			self._states[key] = state
+		self._render(index)
+		self.list.SetFocus()
+		ui.message(self._names[state])
+
+	def on_key(self, event):
+		if event.GetKeyCode() == wx.WXK_SPACE:
+			self.on_cycle(event)
+		else:
+			event.Skip()
+
+	def on_cycle(self, event):
+		index = self._current()
+		if index >= 0:
+			now = self._states.get(self._kinds[index][0], "show")
+			self._set(FILTER_STATES[(FILTER_STATES.index(now) + 1) % len(FILTER_STATES)])
+
+	def on_reset(self, event):
+		self._states = {}
+		self._render(max(self._current(), 0))
+		self.list.SetFocus()
+		ui.message(self._names["show"])
+
+	def picked(self):
+		return {key: state for key, state in self._states.items() if state in ("hide", "only")}
+
+
 class HashtagDialog(wx.Dialog):
 	"""Check the hashtags to search for. Nothing checked: the highlighted one is used."""
 
@@ -134,24 +256,9 @@ class HashtagDialog(wx.Dialog):
 		return [self._tags[i] for i in checked]
 
 
-class VirtualList(wx.ListCtrl):
-	"""A report list that holds no rows: the text of a cell is asked of the panel when the control draws or
-	reads it, so opening a tab costs nothing per row. InsertItem and SetItem must not be used on it."""
-
-	def __init__(self, parent, cell_text):
-		super().__init__(parent, style=wx.LC_REPORT | wx.LC_VIRTUAL)
-		self._cell_text = cell_text
-
-	def OnGetItemText(self, item, col):
-		return self._cell_text(item, col)
-
-	def DeleteAllItems(self):
-		self.SetItemCount(0)
-		return True
-
-
 class TweetPanel(wx.Panel):
-	VIRTUAL = False        # the list is a VirtualList (see _virtual_text); the tab turns it on
+	FILTERABLE = True      # the tab has its own filter (Filter button, see set_filter); a search tab does not: it is edited
+	FILTER_KEYS = TIMELINE_FILTERS  # the kinds of tweet the filter window offers in this tab
 	TRACKS_UNREAD = True   # unread count, Space, mark read/unread
 	SUPPORTS_NTH = True    # Alt+1..9
 	SORTED = True          # rows follow the sort setting (otherwise: the order given)
@@ -167,7 +274,8 @@ class TweetPanel(wx.Panel):
 		"user_follow": ("_do_user_follow", False), "user_mute": ("_do_user_mute", False),
 		"user_block": ("_do_user_block", False), "user_message": ("_do_user_message", False),
 		"quotes": ("_do_quotes", True),
-		"reply": ("_do_reply", True), "retweet": ("_do_retweet", True), "like": ("_do_like", True),
+		"reply": ("_do_reply", True), "reply_all": ("_do_reply_all", True),
+		"retweet": ("_do_retweet", True), "like": ("_do_like", True),
 		"bookmark": ("_do_bookmark", True), "hashtags": ("_do_hashtags", False), "quote_tweet": ("_do_quote", True),
 		"open_browser": ("_do_browser", True), "links": ("_do_links", False), "full_tweet": ("_show_full", False),
 		"copy_row": ("_do_copy_all", False), "copy_text": ("_do_copy_text", True), "copy_link": ("_do_copy_link", True),
@@ -184,6 +292,7 @@ class TweetPanel(wx.Panel):
 		"user_followers": ("_do_user_followers", False), "user_following": ("_do_user_following", False),
 		"user_known_followers": ("_do_user_known_followers", False),
 		"hashtags": ("_do_hashtags", False), "full": ("_show_full", False), "reply": ("_do_reply", True),
+		"reply_all": ("_do_reply_all", True),
 		"quote": ("_do_quote", True), "retweet": ("_do_retweet", True), "like": ("_do_like", True),
 		"bookmark": ("_do_bookmark", True), "browser": ("_do_browser", True), "links": ("_do_links", False),
 		"image": ("_do_image", False), "bemyeyes": ("_do_bemyeyes", False), "copy_image": ("_do_copy_image", False),
@@ -200,10 +309,11 @@ class TweetPanel(wx.Panel):
 		self._parked = False  # focus is waiting on the toolbar button because the list is empty
 		self._quiet_depth = 0  # >0: focus events come from our own code, not the reader
 		self._expanded = set()  # ids of rows shown in full (auto read, main window)
+		self._filter_states = {}  # {kind: "hide" or "only"} of this tab: loaded by _load_filter, once it knows its key
 		self._posts = self._new_posts()
 		self._cell_cache = {}  # virtual list: post id -> the cells of its row, built when the control asks
 
-		self.list = VirtualList(self, self._virtual_text) if self.VIRTUAL else wx.ListCtrl(self, style=wx.LC_REPORT)
+		self.list = VirtualList(self, self._virtual_text)
 		self._cols = None
 		self._build_columns()
 
@@ -211,6 +321,8 @@ class TweetPanel(wx.Panel):
 		self.action_btn = wx.Button(self, label=_("Tweet &action"))
 		# Translators: Button that opens the user menu (Alt+U), the actions about a user of the tweet.
 		self.user_btn = wx.Button(self, label=_("&User action"))
+		# Translators: Button that opens the filter window of the tab. The shortcut is added after the label.
+		self.filter_btn = wx.Button(self, label=keymap.with_key(_("&Filter..."), "edit_search")) if self.FILTERABLE else None
 		self.status = wx.StatusBar(self)
 		# Translators: Accessible name of the status bar of a tweet tab.
 		self.status.SetName(_("Tweets status"))
@@ -218,7 +330,9 @@ class TweetPanel(wx.Panel):
 		sizer = wx.BoxSizer(wx.VERTICAL)
 		self._buttons = buttons = wx.BoxSizer(wx.HORIZONTAL)
 		buttons.Add(self.action_btn, 0, wx.RIGHT, 8)
-		buttons.Add(self.user_btn, 0)
+		buttons.Add(self.user_btn, 0, wx.RIGHT, 8)
+		if self.filter_btn is not None:
+			buttons.Add(self.filter_btn, 0)
 		sizer.Add(self.list, 1, wx.EXPAND | wx.ALL, 8)
 		sizer.Add(buttons, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 		sizer.Add(self.status, 0, wx.EXPAND)
@@ -229,6 +343,8 @@ class TweetPanel(wx.Panel):
 		self.list.Bind(wx.EVT_CONTEXT_MENU, self.on_action)
 		self.action_btn.Bind(wx.EVT_BUTTON, self.on_action)
 		self.user_btn.Bind(wx.EVT_BUTTON, self.on_user_action)
+		if self.filter_btn is not None:
+			self.filter_btn.Bind(wx.EVT_BUTTON, self.on_filter)
 		self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
 
 		self._clock_timer = wx.Timer(self)
@@ -236,7 +352,24 @@ class TweetPanel(wx.Panel):
 		self._update_clock()
 		self._update_status(notify=False)  # the first real count comes with the tweets
 
+	def _predicate(self):
+		"""The test of the filters of this tab, or None when it has none."""
+		states = {k: v for k, v in self._filter_states.items() if k in self.FILTER_KEYS}
+		return (lambda post: post_passes(post, states)) if states else None
+
 	def _new_posts(self):
+		return FilteredPosts(self._new_data(), self._predicate())
+
+	def _shows(self, post):
+		"""Whether the filter of this tab shows this tweet."""
+		predicate = self._predicate()
+		return predicate is None or predicate(post)
+
+	def _all_rows(self):
+		"""Every tweet of the tab, shown or not: what is saved, refreshed and paged. self._posts.rows is what shows."""
+		return self._posts.data.rows
+
+	def _new_data(self):
 		if self.SORTED:
 			return OrderedPosts(self._cfg.get("sort_newest_first"))
 		# NEWEST_FIRST: the order the tab is given in (a thread: oldest first). The reader's Display
@@ -309,39 +442,34 @@ class TweetPanel(wx.Panel):
 				self.list.Focus(idx)
 			self._refresh_rows()
 
-	def _set_row(self, idx, post, opts, insert):
-		if self.VIRTUAL:
-			if not insert:  # a row shown another way (auto read): its cells are built again
-				self._cell_cache.pop(post.id, None)
-				self.list.RefreshItem(idx)
-			return
-		t0 = time.perf_counter()  # TEMP
-		texts = self._cell_texts(post, opts)
-		t1 = time.perf_counter()  # TEMP
-		for col, name in enumerate(self._cols):
-			if col == 0 and insert:
-				self.list.InsertItem(idx, texts[name])
-			else:
-				self.list.SetItem(idx, col, texts[name])
-		self._t_texts = getattr(self, "_t_texts", 0.0) + t1 - t0  # TEMP
-		self._t_wx = getattr(self, "_t_wx", 0.0) + time.perf_counter() - t1  # TEMP
+	def _redraw_row(self, idx, post):
+		"""A row shown another way (auto read): its cells are built again when the control asks."""
+		self._cell_cache.pop(post.id, None)
+		self.list.RefreshItem(idx)
 
 	def _update_status(self, notify=True):
 		"""notify False: the list is only being emptied to be filled again, so the tray must not see a 0."""
 		total = len(self._posts)
+		hidden = len(self._all_rows()) - total
 		if self.TRACKS_UNREAD:
 			unread = sum(1 for p in self._posts.rows if not p.is_read)
 			# Translators: Status bar of the Home tab.
 			text = _("{unread} unread {total} total").format(unread=unread, total=total)
-			if notify:
-				self._unread_changed(unread)
+			if notify:  # the tray counts every unread tweet of the tab, the filtered ones too
+				self._unread_changed(sum(1 for p in self._all_rows() if not p.is_read) if hidden else unread)
 		else:
 			# Translators: Status bar of a thread or quotes tab.
 			text = _("{total} total").format(total=total)
+		if hidden:
+			# Translators: Added to the status bar of a tab when its filter hides some tweets. {text} is the status, {count} the number hidden.
+			text = _("{text}, filter hides {count}").format(text=text, count=hidden)
 		self.status.SetStatusText(text)
 		for button in (self.action_btn, self.user_btn):
 			button.Show(total > 0)
 			button.Enable(total > 0)
+		if self.filter_btn is not None:  # it stays when the filter hides everything: it is the way back
+			self.filter_btn.Show(len(self._all_rows()) > 0)
+			self.filter_btn.Enable(len(self._all_rows()) > 0)
 		self.Layout()
 
 	def _update_clock(self):
@@ -353,22 +481,13 @@ class TweetPanel(wx.Panel):
 	def on_clock_timer(self, event):
 		if self._dead or not self.IsShownOnScreen():
 			return
-		started = time.perf_counter()  # TEMP
-		if self.VIRTUAL:
-			self._cell_cache.clear()  # the cells are built again, with the new times, when the control asks
-			self._refresh_rows()
-			return
-		_a, mode, pattern = self._opts()
-		time_col = self._cols.index("time")
-		for i, p in enumerate(self._posts.rows):
-			self.list.SetItem(i, time_col, format_ts(p.ts, mode, pattern))
-		if time.perf_counter() - started > 0.2:  # TEMP
-			log.info(TAG + "TEMP clock refresh of %s: %d rows took %.2fs" % (self.TAB_NAME, len(self._posts), time.perf_counter() - started))  # TEMP
+		self._cell_cache.clear()  # the cells are built again, with the new times, when the control asks
+		self._refresh_rows()
 
 	def reload_display(self):
 		"""Settings changed: re-sort and re-render every row."""
 		keep_id = self._current_post_id()
-		rows = list(self._posts.rows)
+		rows = list(self._all_rows())
 		if getattr(self._posts, "flipped", False):
 			rows.reverse()  # back to the order the tab was given
 		self._reset_list()
@@ -376,6 +495,67 @@ class TweetPanel(wx.Panel):
 		self._add_posts(rows, fresh=False)
 		self._restore_place(keep_id)
 		self._update_clock()
+
+	# ------------------------------------------------------------ the filter of the tab
+
+	def _filter_key(self):
+		"""Where the tab's filter is kept (account meta): by the identity of the tab, like its place."""
+		key = getattr(self, "TAB_KEY", None)
+		if key:
+			return "tabfilter:" + key
+		return "tabfilter:%s:%s" % (getattr(self, "TAB_TEMP_TYPE", ""), getattr(self, "TAB_TEMP_KEY", ""))
+
+	def _load_filter(self, aid):
+		"""Called by a tab once it knows its key, before it gets its tweets: the filter it had last time."""
+		if not self.FILTERABLE or aid is None:
+			return
+		states = parse_timeline_filter(self._plugin.store.get_account_meta(aid, self._filter_key()))
+		self._filter_states = {k: v for k, v in states.items() if k in self.FILTER_KEYS}
+		self._posts = self._new_posts()
+
+	def filter_counts(self):
+		"""(tweets shown, tweets hidden by the filter)."""
+		return len(self._posts), len(self._all_rows()) - len(self._posts)
+
+	def set_filter(self, keys):
+		"""Keep the filter of this tab (keys: {kind: "hide" or "only"}) and show the tweets that pass it, on the tweet
+		the reader is on when it still shows."""
+		keys = {k: v for k, v in parse_timeline_filter(format_timeline_filter(keys)).items() if k in self.FILTER_KEYS}
+		aid = self._aid()
+		try:
+			self._plugin.store.set_account_meta(aid, self._filter_key(), format_timeline_filter(keys))
+		except Exception:
+			log.error(TAG + "could not save the filter of a tab", exc_info=True)
+		keep_id = self._current_post_id()
+		selected = [p.id for p in self._selected_posts()]
+		self._filter_states = keys
+		self._posts = FilteredPosts(self._posts.data, self._predicate())
+		self._sync_virtual(keep_id, selected)
+		self._update_status()
+		self._restore_place(keep_id)
+
+	@safe_ui
+	def on_filter(self, event=None):
+		"""The Filter button and its key: the filters of this tab, applied at once."""
+		dlg = TimelineFilterDialog(self.GetTopLevelParent(), self._filter_states, self.FILTER_KEYS)
+		try:
+			if dlg.ShowModal() != wx.ID_OK:
+				return
+			keys = dlg.picked()
+		finally:
+			dlg.Destroy()
+		self.set_filter(keys)
+		shown, hidden = self.filter_counts()
+		if len(self._posts):
+			self.list.SetFocus()
+		elif self.filter_btn is not None:
+			self.filter_btn.SetFocus()
+		if not keys:
+			# Translators: Announced after the filter of a tab was cleared. {count} is the number of tweets shown.
+			announce_now(_("Filter cleared. {count} tweets.").format(count=shown))
+		else:
+			# Translators: Announced after the filter of a tab was set. {shown} tweets show, {hidden} are hidden by the filter.
+			announce_now(_("Filter set. {shown} tweets shown, {hidden} hidden.").format(shown=shown, hidden=hidden))
 
 	# ------------------------------------------------------------ list content
 
@@ -400,34 +580,20 @@ class TweetPanel(wx.Panel):
 		fresh: tweets just fetched; their read state is looked up in the cache.
 		older: a batch older than the rows (only matters for a list shown the other way round)."""
 		started = time.perf_counter()  # TEMP
-		self._t_texts = self._t_wx = 0.0  # TEMP
 		added = []
-		opts = self._opts()
 		ordered = sorted(posts, key=lambda p: p.id, reverse=True) if self.SORTED else list(posts)
 		if not self.SORTED and not older and getattr(self._posts, "flipped", False):
 			ordered.reverse()
-		if self.VIRTUAL:
-			keep_id = self._current_post_id()  # the control keeps focus and selection by index: see _sync_virtual
-			selected = [p.id for p in self._selected_posts()]
-			for p in ordered:
-				if self._posts.add(p, older) is not None:
-					added.append(p)
-			t_sync = time.perf_counter()  # TEMP
-			if added:
-				self._sync_virtual(keep_id, selected)
-			self._t_wx = time.perf_counter() - t_sync  # TEMP
-		else:
-			self.list.Freeze()
-			try:
-				with self._quiet():
-					for p in ordered:
-						idx = self._posts.add(p, older)
-						if idx is None:
-							continue
-						self._set_row(idx, p, opts, insert=True)
-						added.append(p)
-			finally:
-				self.list.Thaw()
+		keep_id = self._current_post_id()  # the control keeps focus and selection by index: see _sync_virtual
+		selected = [p.id for p in self._selected_posts()]
+		for p in ordered:
+			if self._posts.add(p, older) is not None:
+				added.append(p)
+		t_sync = time.perf_counter()  # TEMP
+		if added:
+			self._posts.refresh()  # the filtered view, once for the whole batch
+			self._sync_virtual(keep_id, selected)
+		t_list = time.perf_counter() - t_sync  # TEMP
 		if fresh and added and self.TRACKS_UNREAD:
 			unread = self._plugin.store.unread_among(self._aid(), [p.id for p in added])
 			for p in added:
@@ -436,12 +602,14 @@ class TweetPanel(wx.Panel):
 		self._update_status()
 		if len(added) >= 100:  # TEMP
 			log.info(
-				TAG + "TEMP add_posts %s: %d rows, %.2fs in all, texts %.2fs, list %.2fs, status %.2fs" % (
-					self.TAB_NAME, len(added), time.perf_counter() - started, self._t_texts, self._t_wx,
+				TAG + "TEMP add_posts %s: %d rows, %.2fs in all, list %.2fs, status %.2fs" % (
+					self.TAB_NAME, len(added), time.perf_counter() - started, t_list,
 					time.perf_counter() - t_status,
 				)
 			)  # TEMP
-		return len(added)
+		if self._posts.rows is self._posts.data.rows:  # no filter: all of them show
+			return len(added)
+		return sum(1 for p in added if self._posts.index_of(p.id) >= 0)  # what the reader hears about is what shows
 
 	def _top_index(self):
 		"""Index of the newest tweet."""
@@ -617,16 +785,15 @@ class TweetPanel(wx.Panel):
 			return
 		post = self._posts.rows[idx]
 		self._expanded.add(post.id)
-		self._set_row(idx, post, self._opts(), insert=False)
+		self._redraw_row(idx, post)
 
 	def collapse_rows(self):
 		"""Put every expanded row back to the cut cell."""
 		ids, self._expanded = self._expanded, set()
-		opts = self._opts()
 		for post_id in ids:
 			idx = self._posts.index_of(post_id)
 			if 0 <= idx < len(self._posts):
-				self._set_row(idx, self._posts.rows[idx], opts, insert=False)
+				self._redraw_row(idx, self._posts.rows[idx])
 
 	def _focus_next_unread(self):
 		"""Oldest unread tweet first, whatever the sort order."""
@@ -865,6 +1032,15 @@ class TweetPanel(wx.Panel):
 	def _do_reply(self, post, row=None):
 		self._plugin.open_compose(reply_to=post)
 
+	def _do_reply_all(self, post, row=None):
+		"""A reply with the other users of the tweet already in the text, so some can be taken out before posting."""
+		names = reply_all_handles(post, self._plugin.account_handle())
+		if not names:
+			# Translators: Announced by Reply to all when the tweet has no user besides its author.
+			announce_now(_("This tweet has no other users to reply to."))
+			return
+		self._plugin.open_compose(reply_to=post, prefill=" ".join("@" + n for n in names) + " ")
+
 	def _do_quote(self, post, row=None):
 		self._plugin.open_compose(quote_of=post)
 
@@ -1037,9 +1213,14 @@ class TweetPanel(wx.Panel):
 		if keymap.matches(event, "check_updates"):
 			self.onCheckForUpdates(None)
 			return
-		if keymap.matches(event, "edit_search") and callable(getattr(self, "edit_search", None)):
-			self.edit_search()  # only the search tabs have it
-			return
+		if keymap.matches(event, "edit_search"):
+			# one key for what a tab lets the reader edit: a search tab its search, any other tab of tweets its filter
+			if callable(getattr(self, "edit_search", None)):
+				self.edit_search()
+				return
+			if self.FILTERABLE:
+				self.on_filter()  # works with no tweet shown: that is when the filter hides everything
+				return
 		if self.CAN_OLDER and keymap.matches(event, "load_older"):
 			self.onFetchOlder()
 			return
@@ -1107,6 +1288,8 @@ class TweetPanel(wx.Panel):
 		)
 		self._item(menu, _("Un&like") if post.liked else _("&Like"), lambda: self._do_like(post))
 		self._item(menu, _("Repl&y..."), lambda: self._do_reply(post))
+		# Translators: Entry of the tweet action menu: a reply with the other users of the tweet in the text. The shortcut is added after the label.
+		self._item(menu, keymap.with_key(_("Reply to &all..."), "reply_all"), lambda: self._do_reply_all(post))
 		self._item(menu, _("&Quote tweet..."), lambda: self._do_quote(post))
 		self._item(
 			menu, _("Remove boo&kmark") if post.bookmarked else _("&Bookmark"),
@@ -1138,6 +1321,9 @@ class TweetPanel(wx.Panel):
 		self._item(view, _("&Hashtags..."), lambda: self._do_hashtags(post))
 		menu.AppendSubMenu(view, _("&View..."))
 		self._item(menu, keymap.with_key(_("&Full tweet..."), "full_tweet"), lambda: self._show_full(post))
+		if self.FILTERABLE:
+			# Translators: Entry of the tweet action menu: the filters of this tab. The shortcut is added after the label.
+			self._item(menu, keymap.with_key(_("Filter t&weets..."), "edit_search"), self.on_filter)
 		menu.AppendSubMenu(self._copy_menu(post), _("&Copy..."))
 		embed_menu = self._embed_menu(post)
 		if embed_menu is not None:

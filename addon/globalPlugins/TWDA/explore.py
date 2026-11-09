@@ -126,6 +126,8 @@ class ExploreTab(wx.Panel):
 		self._rows = []  # the trends shown: name, query, note
 		self._sources = []  # (kind, value, label) of the trends choice
 		self._previous_source = 0
+		self._editing = None  # key of the search tab whose search is being edited (see load_search)
+		self._new_tab = False
 		state = self._state()
 		self._place = state.get("place") if isinstance(state.get("place"), dict) else None
 
@@ -150,6 +152,9 @@ class ExploreTab(wx.Panel):
 		# Translators: Button that starts the search of the Search and explore tab.
 		self.goBtn = wx.Button(self, label=_("&Go"))
 		sizer.Add(self.goBtn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+		# Translators: Button of the Search and explore tab, shown while the search of a search tab is being edited: the search opens in a tab of its own and the edited tab stays as it was.
+		self.newTabBtn = wx.Button(self, label=_("Open as &new tab"))
+		sizer.Add(self.newTabBtn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 		self.status = wx.StatusBar(self)
 		# Translators: Accessible name of the status bar of the Search and explore tab.
 		self.status.SetName(_("Search and explore status"))
@@ -167,6 +172,7 @@ class ExploreTab(wx.Panel):
 		self.query.Bind(wx.EVT_TEXT_ENTER, self.on_search)
 		self.typeRadio.Bind(wx.EVT_RADIOBOX, self.on_type)
 		self.goBtn.Bind(wx.EVT_BUTTON, self.on_search)
+		self.newTabBtn.Bind(wx.EVT_BUTTON, self.on_search_new)
 		self.advBtn.Bind(wx.EVT_BUTTON, lambda e: self._toggle_adv())
 		self.suggestBtn.Bind(wx.EVT_BUTTON, self.on_add_suggestion)
 		self.source.Bind(wx.EVT_CHOICE, self.on_source)
@@ -280,8 +286,45 @@ class ExploreTab(wx.Panel):
 			panel.Enable(shown)
 		self.goBtn.Show(not trends)
 		self.goBtn.Enable(not trends)
+		self._update_go()
 		self._update_status()
 		self.Layout()
+
+	def _update_go(self):
+		"""While the search of a search tab is being edited, Go replaces the search of that tab and another button
+		opens a tab of its own. Only a search for tweets can edit a tab."""
+		editing = self._editing is not None and self._type() == "tweets"
+		# Translators: Label of the Go button of the Search and explore tab while the search of a search tab is being edited: it puts the new search in that tab.
+		self.goBtn.SetLabel(_("&Update the search tab") if editing else _("&Go"))
+		self.newTabBtn.Show(editing)
+		self.newTabBtn.Enable(editing)
+
+	def editing_done(self, key):
+		"""The search tab with this key was updated, or is gone: the form makes new tabs again."""
+		if self._editing == key:
+			self._editing = None
+			self._update_go()
+			self.Layout()
+
+	def _tweets_search(self, replace):
+		"""Run the search of the form for tweets: in a tab of its own, or (replace: the key of a search tab) in that
+		tab. True when it was started."""
+		built = self._tweets_query()
+		if not built:
+			return False
+		query, form = built
+		self.GetTopLevelParent().open_search(query, self.PRODUCTS[self.order.GetSelection()], form, replace=replace)
+		return True
+
+	def on_search_new(self, event=None):
+		"""While a search tab is being edited: the search in a tab of its own, the edited tab stays as it was."""
+		if self._plugin.account_id() is None:
+			ui.message(_("Add an account first."))
+			return
+		if self._tweets_search(None):
+			self._editing = None
+			self._update_go()
+			self.Layout()
 
 	def on_type(self, event):
 		self._show_type()
@@ -466,14 +509,13 @@ class ExploreTab(wx.Panel):
 				return
 			main.open_people_search(query)
 			return
-		built = self._tweets_query()
-		if built:
-			query, form = built
-			main.open_search(query, self.PRODUCTS[self.order.GetSelection()], form)
+		self._tweets_search(self._editing)
 
-	def load_search(self, params):
+	def load_search(self, params, tab_key=None):
 		"""Edit a search that was run: its text and filters go into the form, to change and run again. A search
-		that was not made here (a hashtag, a trend) has no form: its text becomes the keywords."""
+		that was not made here (a hashtag, a trend) has no form: its text becomes the keywords. tab_key: the search
+		tab the search comes from, which the next search then replaces. (It was called key, and the loop over the
+		advanced fields below reused that name: the tab to replace became the last field, "replies".)"""
 		form = params.get("form") or {
 			"keywords": str(params.get("query") or "").replace(",", " "),  # a comma would split the keywords
 			"order": 1 if params.get("product") == "Top" else 0,
@@ -490,6 +532,9 @@ class ExploreTab(wx.Panel):
 			ctrl.SetValue(fields.get(key) or "")
 		self.order.SetSelection(int(form.get("order") or 0))
 		self._set_adv(bool(form.get("exclude") or include or omit or any(fields.values())))
+		self._editing = tab_key
+		self._update_go()
+		self.Layout()
 		self._save_state()
 
 	# ------------------------------------------------------------ trends

@@ -12,7 +12,7 @@ from logHandler import log
 
 from . import keymap, soundpack, tabstate
 from .useractions import ENTER_USER_ACTIONS, USER_ACTIONS
-from .utils import TAG, announce_now, safe_ui
+from .utils import TAG, VirtualList, announce_now, safe_ui
 
 addonHandler.initTranslation()
 
@@ -41,7 +41,7 @@ class UsersTab(wx.Panel):
 		self.park_control = None  # where the focus goes when the list is emptied (a People tab gives its radio group)
 		self._left = {}  # handle -> (index, row) of a user who left the list at once, for when X refuses
 
-		self.list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+		self.list = VirtualList(self, self._cell_text, wx.LC_SINGLE_SEL)
 		# Translators: Column headers of a list of users.
 		self.list.InsertColumn(0, _("User name"), width=170)
 		self.list.InsertColumn(1, _("Display name"), width=200)
@@ -74,18 +74,20 @@ class UsersTab(wx.Panel):
 	def _remembered_id(self):
 		return self._plugin.store.get_account_meta(self._tab_aid, self._focus_key()) or None
 
+	def _cell_text(self, index, col):
+		"""The text of one cell, asked by the virtual list when it draws or reads it."""
+		if not 0 <= index < len(self._rows) or not 0 <= col < 3:
+			return ""
+		row = self._rows[index]
+		return ("@" + row["handle"], row["name"], row["bio"])[col]
+
 	def _render(self, keep_id=None):
 		"""Fill the list from the rows; the focus goes to the row of keep_id, else to the first one."""
 		self._quiet += 1
-		self.list.Freeze()
 		try:
-			self.list.DeleteAllItems()
-			for i, row in enumerate(self._rows):
-				self.list.InsertItem(i, "@" + row["handle"])
-				self.list.SetItem(i, 1, row["name"])
-				self.list.SetItem(i, 2, row["bio"])
+			self.list.DeleteAllItems()  # also drops the focus and the selection, which are kept by index
+			self.list.SetItemCount(len(self._rows))
 		finally:
-			self.list.Thaw()
 			self._quiet -= 1
 		if self._rows:
 			self._select(next((i for i, r in enumerate(self._rows) if r["id"] == keep_id), 0))
@@ -249,12 +251,14 @@ class UsersTab(wx.Panel):
 			self._params["uid"] = result["uid"]
 		rows = result["users"]
 		changed = [r["id"] for r in rows] != [r["id"] for r in self._rows]
+		shown = {r["id"] for r in self._rows}
+		new = sum(1 for r in rows if r["id"] not in shown)
 		keep_id = self._current_post_id()
 		self._rows = rows
 		self._render(keep_id)
 		self._persist()
 		if done:
-			done(changed)
+			done(new or changed)  # how many are new; True when only the order or the list changed
 			return
 		# Translators: Announced after reading a list of users again. {count} is the number of users.
 		text = _("{count} users.").format(count=len(rows))
@@ -463,6 +467,7 @@ class PeopleTab(wx.Panel):
 		active = self._active()
 		for child in self._children:
 			self._sizer.Show(child, child is active)
+			child.Enable(child is active)  # hidden but enabled lists would still be reachable by NVDA
 		self.Layout()
 
 	def _on_kind(self, event):

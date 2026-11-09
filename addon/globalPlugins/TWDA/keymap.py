@@ -49,6 +49,7 @@ _DEFS = [
 	("user_open_web", "", "tab", False),
 	("quotes", "alt+o", "tab", False),
 	("reply", "alt+y", "tab", False),
+	("reply_all", "alt+shift+y", "tab", False),
 	("retweet", "alt+r", "tab", False),
 	("like", "alt+l", "tab", False),
 	("bookmark", "alt+b", "tab", False),
@@ -417,6 +418,8 @@ def label(action_id):
 			"quotes": _("View quotes"),
 			# Translators: Shortcut action name.
 			"reply": _("Reply"),
+			# Translators: Shortcut action name. The other users of the tweet are put in the reply, to take some out.
+			"reply_all": _("Reply to all (the other users of the tweet are put in the text)"),
 			# Translators: Shortcut action name.
 			"retweet": _("Retweet or undo retweet"),
 			# Translators: Shortcut action name.
@@ -443,8 +446,8 @@ def label(action_id):
 			"select_all": _("Select all tweets"),
 			# Translators: Shortcut action name.
 			"jump_row": _("Jump to a row number"),
-			# Translators: Shortcut action name. It works in the tab of a search.
-			"edit_search": _("Edit this search"),
+			# Translators: Shortcut action name. In the tab of a search it edits the search, in any other tab of tweets it opens the filter window.
+			"edit_search": _("Edit this search, or filter the tweets of this tab"),
 			# Translators: Shortcut action name.
 			"clear_cache": _("Clear the cache of this tab"),
 			# Translators: Shortcut action name.

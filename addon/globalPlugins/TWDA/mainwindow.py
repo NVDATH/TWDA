@@ -14,6 +14,7 @@ import wx
 from logHandler import log
 
 from . import keymap, soundpack, tabstate
+from .chat import ConvoTab, convo_name
 from .dialogs import UserInfoDialog
 from .tabs import QuotesPanel, ThreadPanel, create_feed_tab, make_temp_tab
 from .useractions import populate_user_menu, relation_texts
@@ -193,6 +194,13 @@ class MainWindow(wx.Frame):
 				self.notebook.SetSelection(i)
 				return
 
+	def _tab_by_identity(self, identity):
+		"""(index, panel) of the tab with this identity, or (None, None)."""
+		for i, panel in enumerate(self.getOpenTabs()):
+			if self._getTabIdentity(panel) == identity:
+				return i, panel
+		return None, None
+
 	def focusTabByIdentity(self, identity):
 		for i, panel in enumerate(self.getOpenTabs()):
 			if self._getTabIdentity(panel) == identity:
@@ -215,8 +223,11 @@ class MainWindow(wx.Frame):
 		index = self.notebook.GetSelection()
 		if index == wx.NOT_FOUND:
 			self.removeTabButton.Hide()
+			self.removeTabButton.Enable(False)
 		else:
-			self.removeTabButton.Show(getattr(self.notebook.GetPage(index), "TAB_REMOVABLE", True))
+			removable = getattr(self.notebook.GetPage(index), "TAB_REMOVABLE", True)
+			self.removeTabButton.Show(removable)
+			self.removeTabButton.Enable(removable)
 		self.removeTabButton.GetContainingSizer().Layout()
 		self._update_new_button()
 
@@ -313,6 +324,8 @@ class MainWindow(wx.Frame):
 		store = self._plugin.store
 		if focus_id is not None:  # before the tab is built: it reads its place when it is made
 			store.set_account_meta(aid, "tabfocus:%s:%s" % (entry["type"], entry["key"]), str(focus_id))
+		if entry.get("filter"):  # and its filter
+			store.set_account_meta(aid, "tabfilter:%s:%s" % (entry["type"], entry["key"]), entry["filter"])
 		panel = make_temp_tab(self.notebook, self._plugin, entry, posts)
 		if panel is None:
 			return
@@ -471,24 +484,94 @@ class MainWindow(wx.Frame):
 			return
 		announce_now(_("Loading, please wait."))
 
-	def open_search(self, query, product="Latest", form=None):
+	def open_search(self, query, product="Latest", form=None, replace=None):
 		"""A search tab. Its name is the query exactly as it is sent to X. form: what was typed in the Search and
-		explore tab to make it, kept so the search can be edited."""
+		explore tab to make it, kept so the search can be edited. replace: the key of the search tab whose search
+		was edited: the new search takes the place of that tab's."""
 		# Translators: Name of a search tab. {query} is the search text exactly as sent to X.
 		name = _("Search: {query}").format(query=query)
 		params = {"query": query, "product": product}
 		if form:
 			params["form"] = form
-		self.open_feed("search", "%s|%s" % (product, query), params, name)
+		key = "%s|%s" % (product, query)
+		if replace is not None:
+			if self._tab_by_identity({"kind": "search", "key": replace})[0] is not None:
+				self.replace_search(replace, key, params, name)
+				return
+			self._editing_done(replace)  # that tab is gone: this search becomes a tab of its own
+		self.open_feed("search", key, params, name)
 
-	def edit_search(self, params):
-		"""The form of the Search and explore tab filled with a search that was run, to change it and run it again."""
+	def _editing_done(self, key):
+		"""Tell the Search and explore tab that the search tab it was editing is updated or gone."""
+		for panel in self.getOpenTabs():
+			if getattr(panel, "TAB_KEY", None) == "explore":
+				panel.editing_done(key)
+
+	def replace_search(self, old_key, key, params, name):
+		"""The edited search goes into the tab it came from, which keeps its place among the tabs."""
+		if key == old_key:
+			self.focusTabByIdentity({"kind": "search", "key": key})
+			self._editing_done(old_key)
+			# Translators: Announced when an edited search is the same as the one of the tab, so nothing is loaded again.
+			announce_now(_("The search did not change."))
+			return
+		other, _panel = self._tab_by_identity({"kind": "search", "key": key})
+		if other is not None:
+			self.notebook.SetSelection(other)
+			# Translators: Announced when an edited search is already open in another search tab.
+			announce_now(_("A tab with this search is already open."))
+			return
+		job = lambda result: self._search_replaced(old_key, key, params, name, result)
+		options = {
+			"source": "search", "params": params, "chain": key, "pages": self._plugin.config.get("feed_pages"),
+		}
+		if not self._plugin.start_job("feed", job, options):
+			announce_now(_("Still loading, please wait."))
+			return
+		announce_now(_("Loading, please wait."))
+
+	@safe_ui
+	def _search_replaced(self, old_key, key, params, name, result):
+		if not result["ok"]:
+			soundpack.play("error")
+			announce_now(result["message"])
+			return
+		aid = self._plugin.account_id()
+		if result.get("account_id") != aid:
+			return  # the account was switched meanwhile
+		posts = result["posts"]
+		if not posts:
+			announce_now(_("No tweets found."))
+			return
+		index, panel = self._tab_by_identity({"kind": "search", "key": old_key})
+		if panel is None:  # closed while the search loaded: it becomes a tab of its own
+			self._feed_fetched("search", key, params, name, self._origin_key(), result)
+			self._editing_done(old_key)
+			return
+		panel.retarget(key, params, name, posts)
+		self.notebook.SetPageText(index, name)
+		self._persist_tab_order()
+		if self.notebook.GetSelection() == index:
+			tabstate.set_last(self._plugin.store, aid, {"kind": "search", "key": key})
+		else:
+			self.notebook.SetSelection(index)
+		self.update_title()
+		self._editing_done(old_key)
+		# Translators: Announced after the search of a search tab was edited and loaded. {count} is the number of tweets.
+		announce_now(_("Search tab updated: {count} tweets.").format(count=len(posts)))
+
+	def edit_search(self, params, key=None, name=""):
+		"""The form of the Search and explore tab filled with a search that was run, to change it and run it again.
+		key, name: the search tab it comes from, whose search the next search replaces."""
 		for i, panel in enumerate(self.getOpenTabs()):
 			if getattr(panel, "TAB_KEY", None) == "explore":
 				panel.prepare([])
-				panel.load_search(params)
+				panel.load_search(params, key)
 				self.notebook.SetSelection(i)
 				wx.CallAfter(panel.focus_query)
+				if key is not None:
+					# Translators: Announced when Edit search opens the form for a search tab. {name} is the name of that tab.
+					announce_now(_("Editing the search tab {name}.").format(name=name))
 				return
 
 	def _search_suggestions(self):
@@ -833,6 +916,22 @@ class MainWindow(wx.Frame):
 		text = (getattr(self.notebook.GetPage(index), "NEW_LABEL", None) if index != wx.NOT_FOUND else None) or self._new_label
 		self._button_labels = [(b, text if b is self.newButton else t, a) for b, t, a in self._button_labels]
 		self.refresh_labels()
+
+	def open_convo_tab(self, convo):
+		"""A conversation of the Chat tab in a tab of its own, one tab for each conversation."""
+		key = convo["convo_id"]
+		if self.focusTabByIdentity({"kind": "convo", "key": key}):
+			return
+		aid = self._plugin.account_id()
+		# Translators: Name of the tab of one conversation. {name} is the name of the conversation.
+		name = _("Chat: {name}").format(name=convo_name(convo, self._plugin.config.get("author_mode")))
+		origin = self._origin_key()
+		panel = ConvoTab(self.notebook, self._plugin, key, name, origin_key=origin)
+		store = self._plugin.store
+		tabstate.add_open_tab(store, aid, {"type": "convo", "key": key, "origin": origin, "name": name})
+		tabstate.set_cache(store, aid, "convo", key, [])  # a tab with no cache is dropped when the window is built again
+		self.addTab(panel, panel.TAB_NAME, select=True, removable=True)
+		self._persist_tab_order()
 
 	def start_chat(self, handle, uid=""):
 		"""Start chat of the user menu: the New chat window opens in the Chat tab with the user already picked."""

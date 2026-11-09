@@ -252,6 +252,10 @@ def _stats_of(shown, quote):
 			if isinstance(h, dict) and h.get("text")
 		],
 		"retweeted": bool(legacy.get("retweeted")),
+		"mentions": [
+			m["screen_name"] for m in ((legacy.get("entities") or {}).get("user_mentions") or [])
+			if isinstance(m, dict) and m.get("screen_name")
+		],
 		"quote_liked": bool(_val(quote.tweet, "favorited")) if quote is not None and quote.tweet is not None else None,
 		"quote_bookmarked": bool(_val(quote.tweet, "bookmarked")) if quote is not None and quote.tweet is not None else None,
 		"quote_retweeted": bool(_legacy(quote.tweet).get("retweeted")) if quote is not None and quote.tweet is not None else None,
@@ -673,6 +677,8 @@ class FetchService:
 			return await self._dm_delete_convo(client, account_id, options)
 		if kind == "dm_start":
 			return await self._dm_start(client, account_id, options)
+		if kind == "dm_media":
+			return await self._dm_media(client, account_id, options)
 		if kind == "lists":
 			return await self._lists(client, account_id, options)
 		if kind == "post":
@@ -1516,6 +1522,26 @@ class FetchService:
 		"""Deletes a message for this account only: the other side keeps it."""
 		await client.delete_dm(str(options["id"]))
 		return _ok("dm_delete", [], id=int(options["id"]))
+
+	async def _dm_media(self, client, account_id, options):
+		"""The media of a direct message (options["url"], options["kind"] image or video, options["stem"] the file
+		name) into the temp folder. Its address is not public: it is fetched with the headers of the logged in
+		client, redirects followed, the way twifork's Message.download_attachment does. The headers are copied
+		first, because the content type is taken out of them."""
+		from . import attachments
+		headers = dict(client._base_headers)
+		headers.pop("content-type", None)
+		response = await client._send("GET", options["url"], headers=headers, follow_redirects=True)
+		if response.status_code != 200 or not response.content:
+			return _fail("dm_media", _("X did not give the media (answer {code}).").format(code=response.status_code))
+		try:
+			path = attachments.store_media(
+				options["url"], response.content, response.headers.get("content-type", ""), options["kind"],
+				options["stem"],
+			)
+		except OSError as e:
+			return _fail("dm_media", str(e))
+		return _ok("dm_media", [], path=path)
 
 	async def _dm_start(self, client, account_id, options):
 		"""The first message of a chat: to one user (options["user_ids"] has one id), or to a new group (several).
