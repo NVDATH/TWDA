@@ -129,6 +129,8 @@ async def run_probe(service, client, account_id, options):
 	mute_tests = bool(options.get("mute_tests"))
 	block_tests = bool(options.get("block_tests"))
 	dm_tests = bool(options.get("dm_tests"))
+	list_tests = bool(options.get("list_tests"))
+	list_follow_tests = bool(options.get("list_follow_tests"))
 	full = bool(options.get("full"))
 
 	def add(text=""):
@@ -151,8 +153,8 @@ async def run_probe(service, client, account_id, options):
 	add("Time: %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
 	add("Python: %s" % sys.version.split()[0])
 	add("twikit/twifork: %s" % getattr(twikit, "__version__", "?"))
-	add("Write tests: %s; posting tests: %s; media tests: %s; mute test: %s; block test: %s; direct message test: %s; full run: %s" % tuple(
-		"yes" if v else "no" for v in (write_tests, post_tests, media_tests, mute_tests, block_tests, dm_tests, full)
+	add("Write tests: %s; posting tests: %s; media tests: %s; mute test: %s; block test: %s; direct message test: %s; lists test: %s; list follow test: %s; full run: %s" % tuple(
+		"yes" if v else "no" for v in (write_tests, post_tests, media_tests, mute_tests, block_tests, dm_tests, list_tests, list_follow_tests, full)
 	))
 	missing = [n for n in _PROBE_METHODS if not callable(getattr(client, n, None))]
 	add("Methods missing: " + (", ".join(missing) or "none"))
@@ -435,6 +437,165 @@ async def run_probe(service, client, account_id, options):
 		return "\n" + _indent(notes)
 
 	await step("Users and relations", relations_view)
+
+	def raw_lists(node, found=None):
+		"""Every list the raw answer of X holds: the dicts that have an id_str and a member_count."""
+		found = [] if found is None else found
+		if isinstance(node, dict):
+			if node.get("id_str") and "member_count" in node and "name" in node:
+				found.append(node)
+			else:
+				for value in node.values():
+					raw_lists(value, found)
+		elif isinstance(node, list):
+			for value in node:
+				raw_lists(value, found)
+		return found
+
+	def shape(obj):
+		"""Names and kinds of the fields of a list, never their values."""
+		return ", ".join(
+			"%s:%s" % (n, type(getattr(obj, n)).__name__) for n in sorted(dir(obj))
+			if not n.startswith("_") and not callable(getattr(obj, n, None))
+		)
+
+	async def lists_view():
+		"""Read only. What X gives for the lists of the account (owned and followed: which is which?), for the
+		lists of another user, for the members and followers of a list and for a search. Counts, field names and
+		kinds only: no list name, no user name."""
+		own = user_id_from_twid((service.store.get_cookies(account_id) or {}).get("twid"))
+		notes = []
+		names = (
+			"get_lists", "get_user_lists", "get_list", "get_list_tweets", "get_list_members", "get_list_subscribers",
+			"search_list", "create_list", "edit_list", "delete_list", "add_list_member", "remove_list_member",
+		)
+		notes.append("methods missing: " + (", ".join(n for n in names if not callable(getattr(client, n, None))) or "none"))
+		page = await _tries(client.get_lists, count=100)
+		lists = list(page)
+		notes.append("get_lists: %d lists, %s" % (len(lists), _paging(page)))
+		notes.append("  modes: %s; following %d; is_member %d; muting %d; pinning %d" % (
+			sorted({str(_val(l, "mode")) for l in lists}), sum(1 for l in lists if _val(l, "following")),
+			sum(1 for l in lists if _val(l, "is_member")), sum(1 for l in lists if _val(l, "muting")),
+			sum(1 for l in lists if _val(l, "pinning")),
+		))
+		if lists:
+			notes.append("  fields of a list: " + shape(lists[0]))
+		notes.append("client methods with list in the name: " + ", ".join(sorted(
+			n for n in dir(client) if "list" in n.lower() and not n.startswith("_") and callable(getattr(client, n, None))
+		)))
+		try:
+			following_page = page.next()
+			if hasattr(following_page, "__await__"):
+				following_page = await following_page
+			more = list(following_page) if following_page is not None else []
+			first_ids = {str(_val(l, "id")) for l in lists}
+			notes.append("get_lists second page: %d lists, %d of them new; following %d" % (
+				len(more), sum(1 for l in more if str(_val(l, "id")) not in first_ids),
+				sum(1 for l in more if _val(l, "following")),
+			))
+		except Exception as e:
+			notes.append("get_lists second page: FAIL " + _short_error(e))
+		# the raw answer: does it say who owns a list?
+		try:
+			response, _headers = await _tries(client.gql.list_management_pace_timeline, 100, None)
+			found = raw_lists(response)
+			owners = [((d.get("user_results") or {}).get("result") or {}).get("rest_id") for d in found]
+			notes.append("raw lists: %d; keys of the first: %s" % (len(found), ", ".join(sorted(found[0])) if found else "-"))
+			notes.append("  with an owner: %d; owned by this account: %d; by others: %d" % (
+				sum(1 for o in owners if o), sum(1 for o in owners if o and o == own), sum(1 for o in owners if o and o != own),
+			))
+			for number, (data, owner) in enumerate(zip(found, owners), 1):
+				notes.append("  raw list %d: %s; following %s, is_member %s, mode %s, members %s, subscribers %s" % (
+					number, "owned by this account" if owner == own else "owned by another user", data.get("following"),
+					data.get("is_member"), data.get("mode"), data.get("member_count"), data.get("subscriber_count"),
+				))
+			if found:
+				notes.append("  owner fields of the first: " + ", ".join(sorted(
+					(((found[0].get("user_results") or {}).get("result") or {}).get("core") or {})
+				)))
+			ctx["other_lists"] = [str(d.get("id_str")) for d, o in zip(found, owners) if o and o != own]
+		except Exception as e:
+			notes.append("raw lists: FAIL " + _short_error(e))
+		# the lists of this account through get_user_lists: the same ones?
+		try:
+			mine = list(await _tries(client.get_user_lists, own, count=100))
+			ids, mine_ids = {str(_val(l, "id")) for l in lists}, {str(_val(l, "id")) for l in mine}
+			notes.append("get_user_lists(own): %d lists, %d of them are in get_lists, %d are not" % (
+				len(mine), len(ids & mine_ids), len(mine_ids - ids),
+			))
+		except Exception as e:
+			notes.append("get_user_lists(own): FAIL " + _short_error(e))
+		uid, _screen = first_user()
+		if not uid:  # the Timeline step is a confirmed one and was skipped: take a user from a page of the timeline
+			ctx["tweets"] = list(await _tries(client.get_latest_timeline, count=20))
+			uid, _screen = first_user()
+		if uid:
+			try:
+				theirs = list(await _tries(client.get_user_lists, uid, count=100))
+				notes.append("get_user_lists(another user): %d lists; following %d; modes %s" % (
+					len(theirs), sum(1 for l in theirs if _val(l, "following")), sorted({str(_val(l, "mode")) for l in theirs}),
+				))
+			except Exception as e:
+				notes.append("get_user_lists(another user): FAIL " + _short_error(e))
+		for label, pick in (("a list that is followed", lambda l: _val(l, "following")), ("any list", lambda l: True)):
+			target = next((l for l in lists if pick(l)), None)
+			if target is None:
+				notes.append("%s: none" % label)
+				continue
+			lid = str(_val(target, "id"))
+			notes.append("%s (member_count %s, subscriber_count %s):" % (
+				label, _val(target, "member_count"), _val(target, "subscriber_count"),
+			))
+			for method in ("get_list", "get_list_members", "get_list_subscribers", "get_list_tweets"):
+				await asyncio.sleep(0.7)
+				try:
+					result = await _tries(getattr(client, method), lid) if method == "get_list" else await _tries(
+						getattr(client, method), lid, count=20,
+					)
+					if method == "get_list":
+						notes.append("  get_list: ok, member_count %s" % _val(result, "member_count"))
+					else:
+						items = list(result)
+						notes.append("  %s: %d items, %s" % (method, len(items), _paging(result)))
+						if items and method != "get_list_tweets":
+							notes.append("    user fields: " + shape(items[0]))
+						try:
+							following_page = result.next()
+							if hasattr(following_page, "__await__"):
+								following_page = await following_page
+							notes.append("    next(): %s" % (
+								"%d items" % len(list(following_page)) if following_page is not None else "None"
+							))
+						except Exception as e:
+							notes.append("    next(): FAIL " + _short_error(e))
+				except Exception as e:
+					notes.append("  %s: FAIL %s" % (method, _short_error(e)))
+		others = ctx.get("other_lists") or []
+		if not others:
+			notes.append("a list of another owner: none in the raw answer")
+		for lid in others[:1]:
+			notes.append("a list of another owner:")
+			for method in ("get_list", "get_list_members", "get_list_subscribers", "get_list_tweets"):
+				await asyncio.sleep(0.7)
+				try:
+					if method == "get_list":
+						got = await _tries(client.get_list, lid)
+						notes.append("  get_list: ok, member_count %s, following %s, is_member %s, mode %s" % (
+							_val(got, "member_count"), _val(got, "following"), _val(got, "is_member"), _val(got, "mode"),
+						))
+					else:
+						got = await _tries(getattr(client, method), lid, count=20)
+						notes.append("  %s: %d items, %s" % (method, len(list(got)), _paging(got)))
+				except Exception as e:
+					notes.append("  %s: FAIL %s" % (method, _short_error(e)))
+		try:
+			found = list(await _tries(client.search_list, "news", count=20))
+			notes.append("search_list: %d lists; fields: %s" % (len(found), shape(found[0]) if found else "-"))
+		except Exception as e:
+			notes.append("search_list: FAIL " + _short_error(e))
+		return "\n" + _indent(notes)
+
+	await step("Lists (read only): what X gives for lists, owners, members and followers", lists_view)
 	await step("DM inbox, muted and blocked users (read only)", people_lists_view)
 	await step("Pinned tweets", pinned_view)
 	await step("Direct messages (read only)", dm_view)
@@ -1217,6 +1378,136 @@ async def run_probe(service, client, account_id, options):
 
 		await step("BLOCK: block one user the account has no relation with, try the ways to unblock", block_round_trip)
 
+	if list_tests:
+		async def lists_write_view():
+			"""Creates a private list for the test, adds and removes the account's own id, renames the list and
+			deletes it at the end, whatever happened. Counts, kinds and field names only."""
+			own = user_id_from_twid((service.store.get_cookies(account_id) or {}).get("twid"))
+			if not own:
+				raise RuntimeError("skipped: no twid in the cookies")
+			notes, made = [], None
+			stamp = time.strftime("%H%M%S")
+			try:
+				try:
+					made = await _tries(client.create_list, "tweetAccess test %s" % stamp, "temporary, deleted at once", True)
+				except Exception as e:
+					return "\n" + _indent(["create_list: FAIL " + _short_error(e)])
+				lid = str(_val(made, "id"))
+				notes.append("create_list: ok, mode %s, %s" % (_val(made, "mode"), "fields: " + shape(made)))
+				await asyncio.sleep(2)
+				stages = (
+					("get_lists has it", lambda: _list_has(lid)),
+					("add_list_member (own id)", lambda: client.add_list_member(lid, own)),
+					("get_list after the add: member_count", lambda: _member_count(lid)),
+					("get_list_members has the account", lambda: _members_have(lid, own)),
+					("remove_list_member (own id)", lambda: client.remove_list_member(lid, own)),
+					("get_list after the remove: member_count", lambda: _member_count(lid)),
+					("edit_list (new name, description, private)", lambda: client.edit_list(
+						lid, "tweetAccess test %s b" % stamp, "changed", True)),
+					("get_list after the edit: name changed", lambda: _name_changed(lid, "tweetAccess test %s b" % stamp)),
+				)
+				for label, call in stages:
+					try:
+						value = await _tries(call)
+						notes.append("%s: ok%s" % (label, ", %s" % (value,) if isinstance(value, (bool, int)) else ""))
+					except Exception as e:
+						notes.append("%s: FAIL %s" % (label, _short_error(e)))
+					await asyncio.sleep(1.5)
+			finally:
+				if made is not None:
+					error = "unknown"
+					for _attempt in range(3):
+						try:
+							await client.delete_list(str(_val(made, "id")))
+							error = ""
+							break
+						except Exception as e:
+							error = _short_error(e)
+							await asyncio.sleep(3)
+					notes.append("delete_list: " + ("ok" if not error else "COULD NOT DELETE the test list - delete it by hand: " + error))
+					if not error:
+						await asyncio.sleep(2)
+						try:
+							gone = str(_val(made, "id")) not in {str(_val(l, "id")) for l in await client.get_lists(count=100)}
+							notes.append("get_lists after the delete no longer has it: %s" % gone)
+						except Exception as e:
+							notes.append("get_lists after the delete: FAIL " + _short_error(e))
+			return "\n" + _indent(notes)
+
+		async def _list_has(lid):
+			return lid in {str(_val(l, "id")) for l in await client.get_lists(count=100)}
+
+		async def _member_count(lid):
+			return _val(await client.get_list(lid), "member_count")
+
+		async def _members_have(lid, uid):
+			return uid in {str(_val(u, "id")) for u in await client.get_list_members(lid, count=20)}
+
+		async def _name_changed(lid, name):
+			return _val(await client.get_list(lid), "name") == name
+
+		await step("LISTS WRITE: create a private test list, add and remove the account, rename, delete", lists_write_view)
+
+	if list_follow_tests:
+		async def list_follow_round_trip():
+			"""Follows one public list of another user and unfollows it again, with the old REST requests the web page
+			used (twifork has no method for it), reading the flag of the list back each time. Whatever happens the
+			list is unfollowed at the end; if that fails, the id of the list is in the report."""
+			notes = []
+			found = list(await _tries(client.search_list, "news", count=20))
+			target = next((l for l in found if str(_val(l, "mode")).lower() == "public" and not _val(l, "following")), None)
+			if target is None:
+				raise RuntimeError("skipped: no public list in the search that the account does not follow")
+			lid = str(_val(target, "id"))
+			url = "https://x.com/i/api/1.1/lists/subscribers/%s.json"
+			web = dict(client._base_headers)  # what the web page sends: language en, Origin, the list page as Referer
+			web.update({
+				"content-type": "application/x-www-form-urlencoded", "X-Twitter-Client-Language": "en",
+				"Origin": "https://x.com", "Referer": "https://x.com/i/lists/" + lid,
+			})
+			web.pop("Accept-Language", None)
+			followed = False
+			try:
+				try:
+					await _tries(client.post, url % "create", data={"list_id": lid}, headers=web)
+					notes.append("follow (REST lists/subscribers/create): ok")
+				except Exception as e:
+					notes.append("follow (REST lists/subscribers/create): FAIL " + _short_error(e))
+				await asyncio.sleep(1.5)
+				followed = bool(_val(await _tries(client.get_list, lid), "following"))
+				notes.append("flag following after the follow: %s" % followed)
+				try:
+					mine = {str(_val(l, "id")) for l in list(await _tries(client.get_lists, count=100))}
+					notes.append("get_lists has the followed list: %s" % (lid in mine))
+					response, _headers = await _tries(client.gql.list_management_pace_timeline, 100, None)
+					raw = [d for d in raw_lists(response) if str(d.get("id_str")) == lid]
+					notes.append("the raw answer for the lists of the account has the followed list: %s%s" % (
+						bool(raw), ", following %s, is_member %s" % (raw[0].get("following"), raw[0].get("is_member")) if raw else "",
+					))
+				except Exception as e:
+					notes.append("lists of the account after the follow: FAIL " + _short_error(e))
+			finally:
+				if followed:
+					error = "unknown"
+					for _attempt in range(3):
+						try:
+							await _tries(client.post, url % "destroy", data={"list_id": lid}, headers=web)
+							notes.append("unfollow (REST lists/subscribers/destroy): ok")
+							error = ""
+							break
+						except Exception as e:
+							error = _short_error(e)
+							notes.append("unfollow (REST lists/subscribers/destroy): FAIL " + error)
+							await asyncio.sleep(3)
+					await asyncio.sleep(1.5)
+					still = bool(_val(await _tries(client.get_list, lid), "following"))
+					notes.append("flag following after the unfollow: %s" % still)
+					if still:
+						notes.append("COULD NOT UNFOLLOW the list - unfollow it by hand: https://x.com/i/lists/" + lid)
+			return "\n" + _indent(notes)
+
+		await step("LISTS FOLLOW: follow one public list of another user, read the flag, unfollow again", list_follow_round_trip)
+
 	if dm_tests:
 		async def dm_round_trip():
 			notes, sent = [], []
@@ -1345,7 +1636,7 @@ def run_selfcheck(plugin):
 	import shutil
 	from types import SimpleNamespace
 
-	from . import autoread, compose, dialogs, explore, feedlist, keymap, mainwindow, tabstate, useractions
+	from . import autoread, compose, dialogs, explore, feedlist, keymap, lists, mainwindow, tabstate, useractions
 	from .config import Config
 	from .core import GlobalPlugin
 	from .chat import (
@@ -1412,6 +1703,7 @@ def run_selfcheck(plugin):
 			"window": inspect.getsource(mainwindow.MainWindow._key_actions) + inspect.getsource(mainwindow.MainWindow.onCharHook),
 			"compose": inspect.getsource(compose.ComposeDialog.onCharHook),
 			"details": inspect.getsource(dialogs.FullTextDialog.on_char_hook),
+			"lists": inspect.getsource(lists.ListsTab.on_char_hook),
 		}
 		for area, source in sources.items():
 			problems += [
@@ -2664,6 +2956,296 @@ def run_selfcheck(plugin):
 
 	check("Accounts: separate files and settings, one-time import, removal", storage_accounts)
 
+	def lists_setup():
+		"""A client with two pages of lists, the raw answer that names their owners and every change a list can have."""
+		import asyncio
+
+		def item(i, mode="Public", following=False):
+			return SimpleNamespace(
+				id=str(i), name="L%s" % i, description="a" + chr(10) + "b", mode=mode, member_count=3,
+				subscriber_count=1, following=following,
+			)
+
+		def user(i):
+			return SimpleNamespace(id=str(i), screen_name="u%d" % i, name="N%d" % i, description="bio")
+
+		class Page(list):
+			def __init__(self, items, rest=None):
+				super().__init__(items)
+				self.rest = rest
+
+			def next(self):
+				return self.rest
+
+		def raw(i, owner):
+			return {"id_str": str(i), "name": "L", "member_count": 1, "user_results": {"result": {"rest_id": owner}}}
+
+		class FakeGql:
+			async def list_management_pace_timeline(self, count, cursor):
+				return {"data": {"modules": [{"items": [raw(1, "5"), raw(2, "9")]}, {"other": raw(3, "5")}]}}, {}
+
+		class FakeClient:
+			def __init__(self):
+				self.gql = FakeGql()
+				self.calls = []
+
+			async def get_lists(self, count=100):
+				return Page([item(1, following=True), item(2, following=True)], Page([item(3, "Private")]))
+
+			async def get_user_lists(self, user_id, count=100):
+				return Page([item(7)])
+
+			async def get_user_by_screen_name(self, handle):
+				return SimpleNamespace(id="42")
+
+			async def get_list(self, list_id):
+				return item(list_id)
+
+			async def get_list_members(self, list_id, count=20):
+				return Page([user(1), user(2)], Page([user(3)]))
+
+			async def create_list(self, name, description="", is_private=False):
+				self.calls.append(("create", name, description, is_private))
+				return item(8, "Private" if is_private else "Public")
+
+			async def edit_list(self, list_id, name=None, description=None, is_private=None):
+				self.calls.append(("edit", list_id, name, description, is_private))
+
+			async def delete_list(self, list_id):
+				self.calls.append(("delete", list_id))
+
+			async def add_list_member(self, list_id, user_id):
+				self.calls.append(("add", list_id, user_id))
+				if user_id == "bad":
+					raise ValueError("refused")
+
+			async def remove_list_member(self, list_id, user_id):
+				self.calls.append(("remove", list_id, user_id))
+
+		store = MemoryStore()
+		aid = store.add_account("5", "u", "U", {"auth_token": "a", "ct0": "b", "twid": "u%3D5"})
+		service = FetchService(store, notify=lambda callback, result: None)
+		return asyncio, service, FakeClient(), aid
+
+	def lists_read():
+		asyncio, service, client, aid = lists_setup()
+		old_delay, FetchService.PAGE_DELAY = FetchService.PAGE_DELAY, (0, 0)
+		loop = asyncio.new_event_loop()
+		try:
+			rows = loop.run_until_complete(service._lists(client, aid, {}))["items"]
+			assert [r["id"] for r in rows] == ["1", "2", "3"], rows
+			assert [r["owned"] for r in rows] == [True, False, True], "the owner X names decides: %s" % rows
+			assert rows[0]["following"] is True and rows[2]["private"] is True and not rows[0]["private"], rows
+			assert rows[0]["description"] == "a b" and rows[0]["members"] == 3 and rows[0]["followers"] == 1, rows[0]
+			client.gql = None  # no raw answer: every list counts as the account's own
+			plain = loop.run_until_complete(service._lists(client, aid, {}))["items"]
+			assert all(r["owned"] for r in plain), plain
+			theirs = loop.run_until_complete(service._lists_of_user(client, aid, {"handle": "x"}))
+			assert theirs["uid"] == "42" and [r["id"] for r in theirs["items"]] == ["7"], theirs
+			assert not theirs["items"][0]["owned"], "the lists of another user are not the account's own"
+			members = loop.run_until_complete(service._users(client, aid, {
+				"kind": "list_members", "params": {"handle": "", "uid": "8"}, "chain": "list_members:8",
+				"pages": 1, "all": True,
+			}))
+			assert [u["id"] for u in members["users"]] == ["1", "2", "3"] and members["complete"], members
+		finally:
+			loop.close()
+			FetchService.PAGE_DELAY = old_delay
+
+	def lists_changes():
+		asyncio, service, client, aid = lists_setup()
+		old_delay, FetchService.PAGE_DELAY = FetchService.PAGE_DELAY, (0, 0)
+		loop = asyncio.new_event_loop()
+
+		def do(**options):
+			return loop.run_until_complete(service._list_do(client, aid, options))
+
+		try:
+			made = do(do="create", name="N", description="d", private=True)
+			assert client.calls[-1] == ("create", "N", "d", True), client.calls
+			assert made["item"]["id"] == "8" and made["item"]["private"], made
+			edited = do(do="edit", list_id=8, name="new")
+			assert client.calls[-1] == ("edit", "8", "new", None, None), client.calls
+			assert edited["item"]["id"] == "8", "the list is read again when X does not send it back: %s" % edited
+			do(do="delete", list_id="8")
+			assert client.calls[-1] == ("delete", "8"), client.calls
+			added = do(do="add_members", list_id="8", user_ids=[1, "bad", 2])
+			assert added["users"] == ["1", "2"] and [e[0] for e in added["errors"]] == ["bad"], added
+			assert [c for c in client.calls if c[0] == "add"] == [("add", "8", "1"), ("add", "8", "bad"), ("add", "8", "2")]
+			removed = do(do="remove_members", list_id="8", user_ids=["1"])
+			assert removed["users"] == ["1"] and not removed["errors"], removed
+			try:
+				do(do="rename", list_id="8")
+			except ValueError:
+				pass
+			else:
+				raise AssertionError("an unknown change of a list was accepted")
+		finally:
+			loop.close()
+			FetchService.PAGE_DELAY = old_delay
+
+	check("Lists: rows with their owner, the pages, the lists of a user, the members as users", lists_read)
+	check("Lists: create, edit, delete, add and remove members, the refused one does not stop the rest", lists_changes)
+
+	def lists_tab_labels():
+		from .lists import list_label
+		mine = {"name": "Club", "owned": True, "private": True, "members": 7}
+		assert list_label(mine) == "Club (private, 7 members)", list_label(mine)
+		followed = {"name": "News", "owned": False, "private": False, "members": 50}
+		assert list_label(followed) == "News (followed, public, 50 members)", list_label(followed)
+		assert list_label({"id": "1", "name": "Old"}) == "Old (public, 0 members)", "a row from an older cache"
+
+	def lists_feed_switch():
+		"""The tweets of the Lists tab go to another list: what the old one kept is written first, the cache of the new
+		one is shown, and nothing is read from X."""
+		from .lists import ListFeed
+		calls = []
+		store = MemoryStore()
+		aid = store.add_account("5", "u", "U", {"auth_token": "a", "ct0": "b"})
+		tabstate.set_cache(store, aid, "list", "B", [Post(5, "N (@u)", "t", 0, "https://x.com/u/status/5")])
+		fake = SimpleNamespace(
+			_plugin=SimpleNamespace(store=store), _tab_aid=aid, TAB_TEMP_KEY="A", TAB_NAME="a", _params={},
+			_focus_pending=1, _read_dirty=True, _tried=False,
+			flush_state=lambda: calls.append("flush"), _load_filter=lambda a: calls.append("filter"),
+			_reset_list=lambda: calls.append("reset"),
+			_show=lambda posts, keep: calls.append(("show", [p.id for p in posts], keep)),
+		)
+		ListFeed.show_list(fake, "B", "Name")
+		assert calls == ["flush", "filter", "reset", ("show", [5], None)], calls
+		assert fake.TAB_TEMP_KEY == "B" and fake._params == {"list_id": "B"} and fake.TAB_NAME == "Name", vars(fake)
+		assert fake._tried is True and not fake._read_dirty and fake._focus_pending is None, vars(fake)
+		ListFeed.show_list(fake, "C", "Other")
+		assert fake._tried is False, "a list with nothing cached was never read"
+
+	check("Lists tab: a list is labelled with its kind and its size", lists_tab_labels)
+	def lists_feed_cache():
+		"""The Lists tab is shown again: tweets another tab of the same list put in the cache come in, and nothing is
+		done when the cache holds what the tab has."""
+		from .lists import ListFeed
+		shown = []
+		store = MemoryStore()
+		aid = store.add_account("5", "u", "U", {"auth_token": "a", "ct0": "b"})
+		post = lambda i: Post(i, "N (@u)", "t", 0, "https://x.com/u/status/%d" % i)
+		tabstate.set_cache(store, aid, "list", "B", [post(7), post(5)])
+		fake = SimpleNamespace(
+			_plugin=SimpleNamespace(store=store), _tab_aid=aid, TAB_TEMP_KEY="B", _current_post_id=lambda: 5,
+			_all_rows=lambda: [post(5)], _show=lambda posts, keep: shown.append(([p.id for p in posts], keep)),
+		)
+		ListFeed.reload_cache(fake)
+		assert shown == [([7, 5], 5)], shown
+		fake._all_rows = lambda: [post(5), post(7)]
+		ListFeed.reload_cache(fake)
+		assert len(shown) == 1, "nothing new in the cache: the tab was drawn again"
+		fake.TAB_TEMP_KEY = ""
+		ListFeed.reload_cache(fake)
+		assert len(shown) == 1, "no list shown: nothing to read"
+
+	check("Lists tab: the tweets follow the list selected, from the cache", lists_feed_switch)
+	def lists_tab_cache_kept():
+		"""Closing the tab of a list that is in the Lists tab keeps its tweets, its place and its filter (the Lists tab
+		shows them too); the tab of another user's list goes as any tab does."""
+		from .tabs import ListTab
+		store = MemoryStore()
+		aid = store.add_account("5", "u", "U", {"auth_token": "a", "ct0": "b"})
+		post = Post(5, "N (@u)", "t", 0, "https://x.com/u/status/5")
+		store.set_account_meta(aid, "lists_cache", json.dumps([{"id": "mine", "name": "M"}]))
+		jumps = []
+
+		def closing(key):
+			tabstate.add_open_tab(store, aid, {"type": "list", "key": key, "name": "n"})
+			tabstate.set_cache(store, aid, "list", key, [post])
+			store.set_account_meta(aid, "tabfocus:list:" + key, "5")
+			store.set_account_meta(aid, "tabfilter:list:" + key, "images")
+			fake = SimpleNamespace(
+				_plugin=SimpleNamespace(store=store), _tab_aid=aid, TAB_TEMP_TYPE="list", TAB_TEMP_KEY=key,
+				_originTabKey="lists", _dead=False, flush_state=lambda: jumps.append("flush"),
+				_focus_key=lambda: "tabfocus:list:" + key, _filter_key=lambda: "tabfilter:list:" + key,
+				GetTopLevelParent=lambda: SimpleNamespace(jump_to_permanent=lambda origin: jumps.append(origin)),
+			)
+			fake._in_lists_tab = lambda: ListTab._in_lists_tab(fake)
+			ListTab.onTabRemoved(fake)
+			assert fake._dead, "the tab was not marked as gone"
+			return fake
+
+		closing("mine")
+		assert jumps == ["flush", "lists"], jumps
+		assert [p.id for p in tabstate.get_cache(store, aid, "list", "mine")] == [5], "the tweets of a list of the Lists tab went"
+		assert store.get_account_meta(aid, "tabfocus:list:mine") == "5", "the place went"
+		assert store.get_account_meta(aid, "tabfilter:list:mine") == "images", "the filter went"
+		assert not [e for e in tabstate.get_open_tabs(store, aid) if e["key"] == "mine"], "the tab is still saved as open"
+		jumps.clear()
+		closing("theirs")
+		assert not tabstate.get_cache(store, aid, "list", "theirs"), "the tweets of another user's list stayed"
+		assert not store.get_account_meta(aid, "tabfilter:list:theirs"), "its filter stayed"
+
+	check("Lists tab: newer tweets in the cache come in when the tab is shown again", lists_feed_cache)
+	check("Lists tab: closing the tab of a list that is in the Lists tab keeps its tweets", lists_tab_cache_kept)
+
+	def lists_follow():
+		"""Follow and unfollow a list: the REST request of the web page, with the headers it sends, and the answer says
+		what was done whatever flag X sends back."""
+		import asyncio
+		calls = []
+
+		class FakeClient:
+			_base_headers = {"authorization": "x", "Accept-Language": "th", "content-type": "application/json"}
+
+			async def post(self, url, **kwargs):
+				calls.append((url, kwargs["data"], kwargs["headers"]))
+				return {}, None
+
+			async def get_list(self, list_id):
+				return SimpleNamespace(
+					id=list_id, name="L", description="", mode="Public", member_count=3, subscriber_count=4, following=False,
+				)
+
+		service = FetchService(MemoryStore(), notify=lambda callback, result: None)
+		loop = asyncio.new_event_loop()
+		try:
+			done = loop.run_until_complete(service._list_do(FakeClient(), 1, {"do": "follow", "list_id": 12}))
+			undone = loop.run_until_complete(service._list_do(FakeClient(), 1, {"do": "unfollow", "list_id": 12}))
+		finally:
+			loop.close()
+		assert calls[0][0].endswith("/lists/subscribers/create.json") and calls[0][1] == {"list_id": "12"}, calls
+		assert calls[1][0].endswith("/lists/subscribers/destroy.json") and calls[1][1] == {"list_id": "12"}, calls
+		headers = calls[0][2]
+		assert headers["content-type"] == "application/x-www-form-urlencoded" and "Accept-Language" not in headers, headers
+		assert headers["Referer"] == "https://x.com/i/lists/12" and headers["Origin"] == "https://x.com", headers
+		assert done["item"]["following"] is True and undone["item"]["following"] is False, (done, undone)
+		assert not done["item"]["owned"] and done["item"]["members"] == 3, done
+
+	check("Lists: follow and unfollow use the REST requests of the web page and tell what was done", lists_follow)
+
+	def timers_stopped_before_destroy():
+		"""A wx.Timer still running when its owner window is destroyed fires into freed memory and crashes NVDA (this
+		happened after the main window was closed: the clock of the tweets inside the Lists tab). stop_timers stops
+		those of a window and of every window inside it, and marks the windows gone."""
+		from .utils import stop_timers
+		frame = wx.Frame(None)
+		try:
+			outer = wx.Panel(frame)
+			inner = wx.Panel(outer)  # a window inside a tab, like the tweets of the Lists tab
+			deeper = wx.Panel(inner)
+			outer._dead = inner._dead = False
+			outer.clock = wx.Timer(outer)
+			inner.clock = wx.Timer(inner)
+			inner.focus = wx.Timer(inner)
+			deeper.other = wx.Timer(deeper)
+			outer.clock.Start(60000)
+			inner.clock.Start(60000)
+			inner.focus.StartOnce(800)
+			deeper.other.Start(1000)
+			stop_timers(outer)
+			running = [n for n, t in (("outer", outer.clock), ("inner", inner.clock), ("focus", inner.focus), ("deeper", deeper.other)) if t.IsRunning()]
+			assert not running, "timers kept running: %s" % running
+			assert outer._dead and inner._dead, "the windows were not marked as gone"
+			assert not hasattr(deeper, "_dead"), "a window that has no such flag got one"
+			stop_timers(outer)  # twice is harmless
+		finally:
+			frame.Destroy()
+
+	check("Windows: the timers of a window and of the windows inside it are stopped before it is destroyed", timers_stopped_before_destroy)
+
 	lines.insert(2, "Result: %d ok, %d not ok" % (counts["ok"], counts["bad"]))
 
 	# ---------------------------------------------------------------- what the running add-on holds
@@ -2745,6 +3327,8 @@ class DiagnosticsPage(wx.Panel):
 		("mute_tests", "Mute test: mutes one user you have no relation with, then unmutes"),
 		("block_tests", "Block test: blocks one user you have no relation with, then tries to unblock (use a spare account)"),
 		("dm_tests", "Direct message test: sends test messages to @iannnnn, reacts, then deletes them for you (the other side keeps them)"),
+		("list_tests", "Lists test: creates a private test list, adds and removes your own account, renames it, then deletes it"),
+		("list_follow_tests", "List follow test: follows one public list of another user, reads the flag, then unfollows it again"),
 		("full", "Full run: also the checks that already passed (longer)"),
 	)
 

@@ -26,6 +26,12 @@ from . import keymap
 
 addonHandler.initTranslation()
 
+try:  # TEMP
+	from .crashtrace import trace  # TEMP
+except ImportError:  # TEMP: the developer file is not shipped in releases
+	def trace(*args, **kwargs):  # TEMP
+		pass  # TEMP
+
 APP_NAME = "TWDA"  # the one place that names the add-on
 TAG = APP_NAME + ": "
 
@@ -117,6 +123,30 @@ class VirtualList(wx.ListCtrl):
 	def DeleteAllItems(self):
 		self.SetItemCount(0)
 		return True
+
+
+def stop_timers(window):
+	"""Call before a window of ours is destroyed (the main window closes, the tabs are built again): stops every wx.Timer
+	of the window and of every window inside it, and marks those windows gone (_dead) so that nothing starts a timer
+	again. A wx.Timer that is still running when its owner window is destroyed fires into freed memory, and NVDA
+	crashes inside wxbase: the clock of a list of tweets that lives inside another tab (the Lists tab) was not
+	stopped, because only the timers of the tabs themselves were."""
+	pending, running = [window], []
+	while pending:
+		current = pending.pop()
+		try:
+			pending.extend(current.GetChildren())
+		except RuntimeError:
+			continue  # destroyed already
+		if hasattr(current, "_dead"):
+			current._dead = True
+		for name, value in list(getattr(current, "__dict__", {}).items()):
+			if isinstance(value, wx.Timer):
+				if value.IsRunning():
+					running.append("%s.%s every %d ms" % (type(current).__name__, name, value.GetInterval()))
+				value.Stop()
+	if running:
+		trace("timers were still running when a window went", timers="; ".join(running))  # TEMP
 
 
 def safe_ui(func):
@@ -1066,6 +1096,7 @@ def isolated_modules():
 				and not _is_ours(mod, lib_prefix)
 			):
 				foreign[key] = mod
+		trace("module swap in", foreign=len(foreign), ours=len(_private_modules), names=",".join(sorted(foreign)[:15]))  # TEMP
 		for key in foreign:
 			del sys.modules[key]
 		sys.modules.update(_private_modules)
@@ -1084,3 +1115,4 @@ def isolated_modules():
 					_private_modules[key] = mod
 					del sys.modules[key]
 			sys.modules.update(foreign)
+			trace("module swap out", restored=len(foreign))  # TEMP

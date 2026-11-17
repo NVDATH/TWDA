@@ -29,7 +29,7 @@ from logHandler import log
 
 from .utils import (
 	CURSOR_KEY, FETCH_COUNT, IMPERSONATE, TAG, USE_IMPERSONATE,
-	Post, handle_of, hashed_uid, isolated_modules, login_needed_text, notification_id, set_stat, user_id_from_twid,
+	Post, handle_of, hashed_uid, isolated_modules, login_needed_text, notification_id, set_stat, user_id_from_twid, trace,
 )
 
 addonHandler.initTranslation()
@@ -566,11 +566,15 @@ class FetchService:
 			if job is None:
 				break
 			kind, callback, options, background = job
+			job_started = time.time()  # TEMP
+			trace("job start", kind=kind, background=background, account=options.get("account_id"))  # TEMP
 			try:
 				with isolated_modules():
 					result = loop.run_until_complete(self._attempt(kind, options))
+				trace("job end", kind=kind, seconds="%.1f" % (time.time() - job_started))  # TEMP
 			except Exception as e:
 				log.error(TAG + "%s failed (%s)" % (kind, type(e).__name__), exc_info=True)
+				trace("job failed", kind=kind, error=type(e).__name__, seconds="%.1f" % (time.time() - job_started))  # TEMP
 				if type(e).__name__ in ("Unauthorized", "Forbidden", "InvalidSession") or isinstance(e, CookieError):
 					self.reset_client(options.get("account_id"))  # re-read the cookies of this account next time
 				result = _fail(kind, describe_error(e))
@@ -681,6 +685,10 @@ class FetchService:
 			return await self._dm_media(client, account_id, options)
 		if kind == "lists":
 			return await self._lists(client, account_id, options)
+		if kind == "lists_of_user":
+			return await self._lists_of_user(client, account_id, options)
+		if kind == "list_do":
+			return await self._list_do(client, account_id, options)
 		if kind == "post":
 			return await self._post(client, account_id, options)
 		if kind == "action":
@@ -1356,6 +1364,7 @@ class FetchService:
 		"known_followers": ("get_user_followers_you_know", True),
 		"muted": ("get_muted_users", False), "blocked": ("get_blocked_users", False),
 		"search": ("search_user", False),  # asks for the text options["params"]["query"]
+		"list_members": ("get_list_members", True),  # its "uid" is the id of the list
 	}
 	_LIST_FLAG = {"following": "following", "muted": "muting", "blocked": "blocking"}  # lists that are a relation
 
@@ -1558,10 +1567,126 @@ class FetchService:
 		await client.delete_dm_conversation(str(options["convo_id"]))
 		return _ok("dm_delete_convo", [], convo_id=str(options["convo_id"]))
 
+	@staticmethod
+	def _list_row(item, owned=True):
+		"""A list as a dict for the cache and the tabs. The object X sends has no owner: owned is told by the caller."""
+		return {
+			"id": str(_val(item, "id") or ""), "name": str(_val(item, "name") or ""),
+			"description": " ".join(str(_val(item, "description") or "").split()),
+			"private": str(_val(item, "mode") or "").lower() == "private",
+			"members": _int(_val(item, "member_count")) or 0, "followers": _int(_val(item, "subscriber_count")) or 0,
+			"following": bool(_val(item, "following")), "owned": owned,
+		}
+
+	@classmethod
+	def _raw_list_owners(cls, node, found=None):
+		"""id -> id of the owner for every list in a raw answer of X (a list has id_str, name, member_count and user_results)."""
+		found = {} if found is None else found
+		if isinstance(node, dict):
+			if node.get("id_str") and "member_count" in node and "name" in node:
+				owner = ((node.get("user_results") or {}).get("result") or {}).get("rest_id")
+				if owner:
+					found[str(node["id_str"])] = str(owner)
+			else:
+				for value in node.values():
+					cls._raw_list_owners(value, found)
+		elif isinstance(node, list):
+			for value in node:
+				cls._raw_list_owners(value, found)
+		return found
+
+	async def _collect_pages(self, page):
+		"""Every item of a result and of the pages after it (at most MAX_WALK pages)."""
+		items = list(page)
+		for _n in range(self.MAX_WALK - 1):
+			nxt, _limited = await self._next_page(page)
+			if nxt is None:
+				break
+			page = nxt
+			items.extend(list(page))
+		return items
+
 	async def _lists(self, client, account_id, options):
-		lists = list(await client.get_lists(count=50))
-		items = [{"id": str(_val(l, "id")), "name": str(_val(l, "name") or "")} for l in lists if _val(l, "id")]
-		return _ok("lists", [], items=items)
+		"""The lists of the account as rows (see _list_row). The raw answer of X names the owner of each list, which
+		tells the account's own from the ones it follows; a list whose owner is not known counts as its own."""
+		own = self._own_uid(account_id)
+		items = await self._collect_pages(await client.get_lists(count=100))
+		owners = {}
+		try:
+			response, _headers = await client.gql.list_management_pace_timeline(100, None)
+			owners = self._raw_list_owners(response)
+		except Exception:
+			log.debugWarning(TAG + "could not read the owners of the lists", exc_info=True)
+		rows, seen = [], set()
+		for item in items:
+			owner = owners.get(str(_val(item, "id")))
+			row = self._list_row(item, owner is None or not own or owner == own)
+			if row["id"] and row["id"] not in seen:
+				seen.add(row["id"])
+				rows.append(row)
+		return _ok("lists", [], items=rows, own=own)
+
+	async def _lists_of_user(self, client, account_id, options):
+		"""The lists of another user (options["uid"], or options["handle"] to look the id up) as rows. X says "owned
+		or followed" and the objects have no owner, so the rows may include lists the user only follows."""
+		uid = str(options.get("uid") or "")
+		if not uid:
+			uid = str(_val(await client.get_user_by_screen_name(str(options["handle"])), "id") or "")
+		if not uid:
+			raise ValueError("no user id")
+		items = await self._collect_pages(await client.get_user_lists(uid, count=100))
+		rows = [self._list_row(i, False) for i in items if _val(i, "id")]
+		return _ok("lists_of_user", [], items=rows, uid=uid)
+
+	async def _list_do(self, client, account_id, options):
+		"""A change to a list (options["do"]): create (name, description, private), edit (list_id and the same fields; a
+		field that is not given stays as it is), delete (list_id), add_members or remove_members (list_id and user_ids:
+		one request for each user, with the pause between pages, and a refusal of one does not stop the others)."""
+		action = options["do"]
+		if action == "create":
+			made = await client.create_list(options["name"], options.get("description") or "", bool(options.get("private")))
+			return _ok("list_do", [], done=action, item=self._list_row(made))
+		list_id = str(options["list_id"])
+		if action == "edit":
+			changed = await client.edit_list(
+				list_id, options.get("name"), options.get("description"), options.get("private"),
+			)
+			fresh = changed if _val(changed, "id") else await client.get_list(list_id)  # X may not send the list back
+			return _ok("list_do", [], done=action, item=self._list_row(fresh))
+		if action in ("follow", "unfollow"):
+			# twifork has no method for it: the REST requests the web page used (the probe confirmed they work)
+			headers = dict(client._base_headers)
+			headers.update({
+				"content-type": "application/x-www-form-urlencoded", "X-Twitter-Client-Language": "en",
+				"Origin": "https://x.com", "Referer": "https://x.com/i/lists/" + list_id,
+			})
+			headers.pop("Accept-Language", None)
+			await client.post(
+				"https://x.com/i/api/1.1/lists/subscribers/%s.json" % ("create" if action == "follow" else "destroy"),
+				data={"list_id": list_id}, headers=headers,
+			)
+			row = self._list_row(await client.get_list(list_id), owned=False)
+			row["following"] = action == "follow"  # the flag X sends can lag behind the request
+			return _ok("list_do", [], done=action, item=row)
+		if action == "delete":
+			await client.delete_list(list_id)
+			return _ok("list_do", [], done=action, list_id=list_id)
+		if action not in ("add_members", "remove_members"):
+			raise ValueError("unknown change of a list: %r" % (action,))
+		call = client.add_list_member if action == "add_members" else client.remove_list_member
+		done, errors = [], []
+		for number, user_id in enumerate(str(i) for i in options["user_ids"]):
+			if number:
+				await self._pause()
+			try:
+				await call(list_id, user_id)
+				done.append(user_id)
+			except Exception as e:
+				log.debugWarning(TAG + "a list member could not be changed (%s)" % type(e).__name__, exc_info=True)
+				errors.append([user_id, describe_error(e)])
+				if type(e).__name__ == "TooManyRequests":
+					break  # the rest would be refused too
+		return _ok("list_do", [], done=action, list_id=list_id, users=done, errors=errors)
 
 	# -------------------------------------------------------------- posting
 
@@ -1596,11 +1721,15 @@ class FetchService:
 		if media_ids:
 			kwargs["media_ids"] = media_ids
 		tweet = await client.create_tweet(text=options["text"], **kwargs)
+		legacy = _legacy(tweet)  # TEMP
+		log.info(TAG + "TEMP post answer: attachment_url=%r is_quote_status=%s quote_object=%s quoted_status_id=%s permalink=%s text_end=%r urls=%s" % (kwargs.get("attachment_url"), _val(tweet, "is_quote_status"), _val(tweet, "quote") is not None, legacy.get("quoted_status_id_str"), legacy.get("quoted_status_permalink"), str(_val(tweet, "full_text") or "")[-70:], [u.get("expanded_url") for u in (_val(tweet, "urls") or []) if isinstance(u, dict)]))  # TEMP
 		try:
 			posts = [tweet_to_post(tweet)]
 		except Exception:
 			log.error(TAG + "could not read the tweet that was just posted", exc_info=True)
 			posts = []
+		if posts:  # TEMP
+			log.info(TAG + "TEMP post row: message_end=%r quote_author=%r quote_text_start=%r" % (posts[0].message[-70:], posts[0].quote_author, posts[0].quote_text[:40]))  # TEMP
 		return _ok("post", posts)
 
 	# -------------------------------------------------------------- actions

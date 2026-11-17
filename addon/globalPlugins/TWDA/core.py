@@ -25,7 +25,7 @@ from .storage import open_store
 from .tabs import build_tabs
 from .tray import TrayIcon, category_labels, choose_overlay, fill_app_menu
 from .utils import (
-	APP_NAME, TAG, account_label, announce_after_menu, announce_now, is_pinned, parse_timeline_filter, post_passes,
+	APP_NAME, TAG, account_label, announce_after_menu, announce_now, is_pinned, parse_timeline_filter, post_passes, trace,
 )
 
 addonHandler.initTranslation()
@@ -47,6 +47,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	def __init__(self):
 		super().__init__()
+		try:  # TEMP
+			from . import crashtrace  # TEMP
+			crashtrace.start()  # TEMP
+		except ImportError:  # TEMP: the developer file is not shipped in releases
+			pass  # TEMP
+		except Exception:  # TEMP
+			log.error(TAG + "could not start the crash tracer", exc_info=True)  # TEMP
 		self._store = None
 		self._service = None
 		self._config = None
@@ -81,6 +88,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		wx.CallLater(STARTUP_DELAY_MS, self._startup)
 
 	def terminate(self):
+		trace("terminate")  # TEMP
 		self._terminating = True
 		try:
 			self._bg_timer.Stop()
@@ -120,6 +128,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			self._service.stop()
 		if self._store is not None:
 			self._store.close()
+		try:  # TEMP
+			from . import crashtrace  # TEMP
+			crashtrace.stop()  # TEMP
+		except ImportError:  # TEMP
+			pass  # TEMP
 		super().terminate()
 
 	# ------------------------------------------------------------ backend
@@ -378,6 +391,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	def _open_main(self):
 		t0 = time.perf_counter()  # TEMP
+		trace("open main window")  # TEMP
 		gui.mainFrame.prePopup()
 		try:
 			main = MainWindow(gui.mainFrame, self)
@@ -400,6 +414,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		)  # TEMP
 
 	def main_closed(self, main):
+		trace("main window closed")  # TEMP
 		if self._main is main:
 			self._main = None
 		gui.mainFrame.postPopup()
@@ -795,6 +810,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		"""Every tick starts at most one due check (account and category), the most overdue first, so a
 		check never asks X for everything at once and every account gets its turn."""
 		tick_start = time.perf_counter()  # TEMP
+		trace("bg tick", busy=self._service is not None and self._service.busy)  # TEMP
 		try:
 			self._ensure_backend()
 			if self._service.busy:
@@ -813,6 +829,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def _run_bg(self, aid, cat):
 		"""Start the background check of one item (Home, Notifications, Bookmarks or an open tab, "<type>:<key>")
 		of one account. Returns False if nothing was started."""
+		trace("bg check", item=cat, account=aid)  # TEMP
 		if cat == "home":
 			return self._service.submit("reload", self._on_bg_result, {"account_id": aid}, background=True)
 		if cat in ("notifications", "bookmarks"):

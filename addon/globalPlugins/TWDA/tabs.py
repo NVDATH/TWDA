@@ -711,6 +711,28 @@ class SearchTab(FeedTab):
 class ListTab(FeedTab):
 	SOURCE = "list"
 
+	def _in_lists_tab(self):
+		"""Whether the list is one of the Lists tab (kept in the account's cache of lists)."""
+		try:
+			rows = json.loads(self._plugin.store.get_account_meta(self._tab_aid, "lists_cache") or "[]")
+		except ValueError:
+			return False
+		return isinstance(rows, list) and any(isinstance(r, dict) and r.get("id") == self.TAB_TEMP_KEY for r in rows)
+
+	def onTabRemoved(self):
+		"""The Lists tab shows the same cache, place and filter for a list of its own, so closing the tab of that list
+		must not take them away. The tab of another user's list (from Find lists by user) goes like any other tab."""
+		if not self._in_lists_tab():
+			TempTab.onTabRemoved(self)
+			return
+		self.flush_state()  # the read marks and the place go to the cache first
+		self._dead = True
+		for value in vars(self).values():
+			if isinstance(value, wx.Timer):
+				value.Stop()
+		tabstate.remove_open_tab(self._plugin.store, self._tab_aid, self.TAB_TEMP_TYPE, self.TAB_TEMP_KEY)
+		self.GetTopLevelParent().jump_to_permanent(self._originTabKey)
+
 
 FEED_TABS = {"user": UserTab, "search": SearchTab, "list": ListTab}
 
@@ -887,8 +909,13 @@ OPTIONAL_TABS = (
 	("people", lambda parent, plugin: PeopleTab(parent, plugin)),
 	("bookmarks", lambda parent, plugin: BookmarksTab(
 		parent, plugin, {}, _cached(plugin, "bookmarks"), "bookmarks", _("Bookmarks"))),
-	("lists", lambda parent, plugin: ListsPanel(parent, plugin)),
+	("lists", lambda parent, plugin: _lists_tab(parent, plugin)),
 )
+
+
+def _lists_tab(parent, plugin):
+	from .lists import ListsTab  # here, not at the top: lists.py builds on FeedTab of this file
+	return ListsTab(parent, plugin)
 
 
 def build_tabs(main, plugin):

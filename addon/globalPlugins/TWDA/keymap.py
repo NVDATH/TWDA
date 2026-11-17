@@ -77,6 +77,11 @@ _DEFS = [
 	("close_compose", "ctrl+w", "compose", False),
 	("refresh_details", "f5", "details", False),
 	("copy_line", "ctrl+c", "details", False),
+	("list_edit", "", "lists", False),
+	("list_manage_members", "", "lists", False),
+	("list_find", "", "lists", False),
+	("list_open_tab", "", "lists", False),
+	("list_remove", "delete", "lists", False),
 ]
 
 _NAMES = {
@@ -280,8 +285,9 @@ def event_to_text(evt):
 
 
 def _overlap(a, b):
-	"""Areas whose keys reach the same window: the main window and its tabs share the keyboard."""
-	return a == b or {a, b} == {"window", "tab"}
+	"""Areas whose keys reach the same window: the main window and its tabs share the keyboard (the Lists tab holds
+	its own keys and the keys of a list of tweets)."""
+	return a == b or {a, b} <= {"window", "tab", "lists"}
 
 
 def conflicts(action_id, text, bindings=None):
@@ -320,7 +326,7 @@ def check(action_id, text, bindings=None):
 	if printable and ctrl and alt:
 		# Translators: Shortcut error: Ctrl+Alt is how some keyboard layouts type extra characters.
 		return _("Ctrl+Alt with a letter, digit or symbol is not allowed.")
-	if not printable and not (ctrl or alt) and key not in _FKEYS:
+	if not printable and not (ctrl or alt) and key not in _FKEYS and not (area(action_id) == "lists" and key == wx.WXK_DELETE):
 		# Translators: Shortcut error: keys like Delete or Enter alone are fixed.
 		return _("This key needs Ctrl or Alt.")
 	if area(action_id) == "compose" and ((ctrl and key in _EDIT_LETTERS) or key in _EDIT_KEYS):
@@ -343,6 +349,8 @@ def area_label(area_id):
 		"compose": _("New tweet window"),
 		# Translators: Area name on the Shortcuts page.
 		"details": _("Full tweet window"),
+		# Translators: Area name on the Shortcuts page: the keys of the list of lists in the Lists tab.
+		"lists": _("Lists tab"),
 	}.get(area_id, area_id)
 
 
@@ -357,7 +365,7 @@ def label(action_id):
 			# Translators: Shortcut action name.
 			"search": _("Go to the search field (Search and explore tab)"),
 			# Translators: Shortcut action name.
-			"new_tweet": _("New tweet (New chat in the Chat tab)"),
+			"new_tweet": _("New tweet (New chat in the Chat tab, New list in the Lists tab)"),
 			# Translators: Shortcut action name.
 			"settings": _("Open settings"),
 			# Translators: Shortcut action name.
@@ -474,5 +482,15 @@ def label(action_id):
 			"refresh_details": _("Refresh the details"),
 			# Translators: Shortcut action name.
 			"copy_line": _("Copy the selected line"),
+			# Translators: Shortcut action name. It works on the list in focus in the list of lists of the Lists tab.
+			"list_edit": _("Edit the list (name, description, privacy)"),
+			# Translators: Shortcut action name. It works on the list in focus in the list of lists of the Lists tab.
+			"list_manage_members": _("Manage the members of the list"),
+			# Translators: Shortcut action name. It works in the list of lists of the Lists tab.
+			"list_find": _("Find the lists of a user"),
+			# Translators: Shortcut action name. It works on the list in focus in the list of lists of the Lists tab.
+			"list_open_tab": _("Open the list in a new tab"),
+			# Translators: Shortcut action name. It works on the list in focus in the list of lists of the Lists tab; a list that is only followed is unfollowed on x.com.
+			"list_remove": _("Remove the list"),
 		}
 	return _labels.get(action_id, action_id)

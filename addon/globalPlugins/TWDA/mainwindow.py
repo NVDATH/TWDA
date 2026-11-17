@@ -21,7 +21,7 @@ from .useractions import populate_user_menu, relation_texts
 from .userstab import UsersTab
 from .utils import (
 	APP_NAME, TAG, announce_now, author_handle, handle_from_url, load_stats, main_title, quotes_tab_name,
-	hashtags_of, mentions_of, relevant_users, safe_ui, target_id, users_tab_name,
+	hashtags_of, mentions_of, relevant_users, safe_ui, stop_timers, target_id, users_tab_name,
 )
 
 addonHandler.initTranslation()
@@ -130,10 +130,7 @@ class MainWindow(wx.Frame):
 		try:
 			self.flush_state()
 			for panel in self.getOpenTabs():
-				panel._dead = True
-				for value in vars(panel).values():
-					if isinstance(value, wx.Timer):
-						value.Stop()
+				stop_timers(panel)
 			self.notebook.DeleteAllPages()
 			self.home = None
 			builder()
@@ -1019,9 +1016,6 @@ class MainWindow(wx.Frame):
 				panel.flush_state()
 			except Exception:
 				log.error(TAG + "could not save a tab", exc_info=True)
-			panel._dead = True
-			for value in vars(panel).values():
-				if isinstance(value, wx.Timer):
-					value.Stop()
+			stop_timers(panel)
 		self._plugin.main_closed(self)
 		self.Destroy()
